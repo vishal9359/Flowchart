@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.flowchart_cache/
+output/
+*.egg-info/
+.env

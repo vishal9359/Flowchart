@@ -184,10 +184,39 @@ def _extent_text(lines: List[str],
 # Per-file knowledge extractor
 # ---------------------------------------------------------------------------
 
+_CONTAINER_KINDS = frozenset({
+    ci.CursorKind.NAMESPACE,
+    ci.CursorKind.CLASS_DECL,
+    ci.CursorKind.STRUCT_DECL,
+    ci.CursorKind.CLASS_TEMPLATE,
+    ci.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
+    ci.CursorKind.UNION_DECL,
+})
+
+
+def _norm_path(p: str) -> str:
+    """Normalise a file path for comparison: forward slashes, resolved symlinks."""
+    try:
+        return str(Path(p).resolve()).replace("\\", "/")
+    except Exception:
+        return p.replace("\\", "/")
+
+
+def _safe_line(lines: List[str], line_number: int) -> Optional[str]:
+    """Return the source line for a 1-based line_number, or None if out of range."""
+    idx = line_number - 1
+    if 0 <= idx < len(lines):
+        return lines[idx]
+    return None
+
+
 class FileKnowledgeExtractor:
     """
     Parses one source file and extracts all knowledge artifacts.
     Results are accumulated into the provided ProjectKnowledge object.
+
+    Key invariant: every cursor passed to an _extract_* method is
+    guaranteed to belong to the file currently being scanned.
     """
 
     def __init__(self, index: ci.Index, std: str,
@@ -200,8 +229,9 @@ class FileKnowledgeExtractor:
                 knowledge: ProjectKnowledge,
                 base_path: str) -> None:
         """Parse file_path and populate knowledge."""
-        abs_path = str(file_path)
+        abs_path = str(file_path.resolve())
         rel_path = _relative(abs_path, base_path)
+        abs_path_norm = _norm_path(abs_path)
 
         try:
             lines = file_path.read_text(encoding="utf-8",
@@ -221,25 +251,35 @@ class FileKnowledgeExtractor:
             logger.warning("libclang returned None TU for %s", abs_path)
             return
 
-        self._traverse(tu.cursor, lines, abs_path, rel_path, knowledge)
+        self._traverse(tu.cursor, lines, abs_path_norm, rel_path, knowledge)
 
     # ------------------------------------------------------------------
     # AST traversal
     # ------------------------------------------------------------------
 
     def _traverse(self, cursor: ci.Cursor, lines: List[str],
-                  abs_path: str, rel_path: str,
+                  abs_path_norm: str, rel_path: str,
                   knowledge: ProjectKnowledge) -> None:
+        """
+        Walk cursor children.  Only cursors whose location.file exactly
+        matches abs_path_norm are processed — cursors from included headers
+        or system files are skipped completely.  This prevents line-index
+        errors that arise when a header's line numbers exceed the current
+        file's line count.
+        """
         for child in cursor.get_children():
-            # Only process declarations defined in this file
             loc = child.location
             if not loc.file:
                 continue
-            child_file = loc.file.name.replace("\\", "/")
-            if not child_file.endswith(abs_path.replace("\\", "/")):
-                # Might be from an included header — still process headers
-                # but only at top-level (direct children of TU cursor)
-                pass
+
+            # Exact file match — skip anything from a different file
+            child_file_norm = _norm_path(loc.file.name)
+            if child_file_norm != abs_path_norm:
+                continue
+
+            # Guard: location.line must be valid for our lines array
+            if loc.line < 1 or loc.line > len(lines):
+                continue
 
             kind = child.kind
 
@@ -256,13 +296,10 @@ class FileKnowledgeExtractor:
             elif kind in _FUNCTION_KINDS and child.is_definition():
                 self._extract_function(child, lines, rel_path, knowledge)
 
-            # Recurse into namespaces, classes, structs, templates
-            elif kind in (ci.CursorKind.NAMESPACE,
-                          ci.CursorKind.CLASS_DECL,
-                          ci.CursorKind.STRUCT_DECL,
-                          ci.CursorKind.CLASS_TEMPLATE,
-                          ci.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION):
-                self._traverse(child, lines, abs_path, rel_path, knowledge)
+            elif kind in _CONTAINER_KINDS:
+                # Recurse into namespaces / classes — passing same
+                # abs_path_norm so inner cursors are still file-checked
+                self._traverse(child, lines, abs_path_norm, rel_path, knowledge)
 
     # ------------------------------------------------------------------
     # Function extraction
@@ -275,7 +312,6 @@ class FileKnowledgeExtractor:
         if not qname:
             return
 
-        # Build human-readable signature
         ret = cursor.result_type.spelling if cursor.result_type else ""
         params = []
         for c in cursor.get_children():
@@ -287,8 +323,9 @@ class FileKnowledgeExtractor:
 
         line_idx = cursor.location.line - 1
         comment = _preceding_comment(lines, line_idx)
-        if not comment and 0 <= line_idx < len(lines):
-            comment = _inline_comment(lines[line_idx])
+        src_line = _safe_line(lines, cursor.location.line)
+        if not comment and src_line:
+            comment = _inline_comment(src_line)
 
         fk = FunctionKnowledge(
             qualified_name=qname,
@@ -297,7 +334,6 @@ class FileKnowledgeExtractor:
             line=cursor.location.line,
             comment=comment,
         )
-        # Don't overwrite if we already have a richer entry
         existing = knowledge.functions.get(qname)
         if existing is None or (not existing.comment and comment):
             knowledge.functions[qname] = fk
@@ -323,23 +359,21 @@ class FileKnowledgeExtractor:
         )
 
         for child in cursor.get_children():
-            if child.kind == ci.CursorKind.ENUM_CONSTANT_DECL:
-                const_name = child.spelling
-                const_val = str(child.enum_value)
-                c_line = child.location.line - 1
-                c_comment = ""
-                if 0 <= c_line < len(lines):
-                    c_comment = _inline_comment(lines[c_line])
-                if not c_comment:
-                    c_comment = _preceding_comment(lines, c_line)
-                ek.values[const_name] = EnumValueKnowledge(
-                    value=const_val,
-                    comment=c_comment,
-                )
+            if child.kind != ci.CursorKind.ENUM_CONSTANT_DECL:
+                continue
+            const_name = child.spelling
+            const_val = str(child.enum_value)
+            src_line = _safe_line(lines, child.location.line)
+            c_comment = _inline_comment(src_line) if src_line else ""
+            if not c_comment:
+                c_comment = _preceding_comment(lines, child.location.line - 1)
+            ek.values[const_name] = EnumValueKnowledge(
+                value=const_val,
+                comment=c_comment,
+            )
 
         if ek.values:
             knowledge.enums[name] = ek
-            # Also index by simple name without namespace
             simple = name.split("::")[-1]
             if simple != name:
                 knowledge.enums[simple] = ek
@@ -352,33 +386,36 @@ class FileKnowledgeExtractor:
                         rel_path: str,
                         knowledge: ProjectKnowledge) -> None:
         name = cursor.spelling
-        if not name or name.startswith("_"):  # skip internal macros
+        if not name or name.startswith("_"):
             return
 
-        # Get macro value from extent text
         ext = cursor.extent
+
+        # Guard: both start and end lines must be within bounds
+        if ext.start.line < 1 or ext.start.line > len(lines):
+            return
+        if ext.end.line < 1 or ext.end.line > len(lines):
+            return
+
         full_text = _extent_text(lines,
                                   ext.start.line, ext.end.line,
                                   ext.start.column, ext.end.column)
         value = full_text[len(name):].strip() if full_text.startswith(name) else full_text
 
-        # Skip function-like macros (have parameter list)
+        # Skip function-like macros and include guards
         if value.startswith("("):
             return
-        # Skip empty macros and include guards
         if not value or re.match(r"^[A-Z_]+_H[_H]?$", name):
             return
 
-        line_idx = ext.start.line - 1
-        comment = ""
-        if 0 <= line_idx < len(lines):
-            comment = _inline_comment(lines[line_idx])
+        src_line = _safe_line(lines, ext.start.line)
+        comment = _inline_comment(src_line) if src_line else ""
         if not comment:
-            comment = _preceding_comment(lines, line_idx)
+            comment = _preceding_comment(lines, ext.start.line - 1)
 
         knowledge.macros[name] = MacroKnowledge(
             name=name,
-            value=value[:120],   # cap long macro values
+            value=value[:120],
             file=rel_path,
             comment=comment,
         )
@@ -405,8 +442,9 @@ class FileKnowledgeExtractor:
 
         line_idx = cursor.location.line - 1
         comment = _preceding_comment(lines, line_idx)
-        if not comment and 0 <= line_idx < len(lines):
-            comment = _inline_comment(lines[line_idx])
+        src_line = _safe_line(lines, cursor.location.line)
+        if not comment and src_line:
+            comment = _inline_comment(src_line)
 
         knowledge.typedefs[name] = TypedefKnowledge(
             name=name,

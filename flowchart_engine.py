@@ -49,6 +49,7 @@ from models import FileResult, FlowchartResult, FunctionEntry, ProjectMeta
 from output.writer import OutputWriter
 from pkb.builder import ProjectKnowledgeBase
 from pkb.cache import PkbCache
+from pkb.knowledge import ProjectKnowledge, load_knowledge
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -89,6 +90,9 @@ def _parse_args() -> EngineConfig:
                    help="LLM model name")
     p.add_argument("--function-key", default=None,
                    help="Process only this function key (optional filter)")
+    p.add_argument("--knowledge-json", default=None,
+                   dest="knowledge_json",
+                   help="Path to project_knowledge.json built by project_scanner.py")
     p.add_argument("--no-cache", action="store_true",
                    help="Rebuild PKB from scratch (ignore disk cache)")
     p.add_argument("--cache-dir", default=".flowchart_cache",
@@ -118,6 +122,7 @@ def _parse_args() -> EngineConfig:
         llm_url=args.llm_url,
         llm_model=args.llm_model,
         function_key=args.function_key,
+        knowledge_json_path=args.knowledge_json,
         use_cache=not args.no_cache,
         cache_dir=args.cache_dir,
         llm_timeout=args.llm_timeout,
@@ -190,6 +195,7 @@ def _process_function(
     label_generator: LabelGenerator,
     config: EngineConfig,
     base_path: str,
+    project_knowledge: Optional[ProjectKnowledge] = None,
 ) -> FlowchartResult:
     """
     Process a single function end-to-end.
@@ -226,10 +232,11 @@ def _process_function(
         logger.debug("CFG built: %d nodes, %d edges for '%s'",
                      len(cfg.nodes), len(cfg.edges), qn)
 
-        # 5. Enrich CFG nodes with PKB context
+        # 5. Enrich CFG nodes with PKB context + project knowledge
         enricher = NodeEnricher(
             pkb,
-            source_lines_by_file={func_entry.file: source_lines}
+            source_lines_by_file={func_entry.file: source_lines},
+            knowledge=project_knowledge,
         )
         enricher.enrich(cfg, func_entry)
 
@@ -279,6 +286,8 @@ def run(config: EngineConfig) -> None:
     logger.info("  metadata.json  : %s", config.metadata_json_path)
     logger.info("  out-dir        : %s", config.out_dir)
     logger.info("  LLM            : %s  model=%s", config.llm_url, config.llm_model)
+    if config.knowledge_json_path:
+        logger.info("  knowledge-json : %s", config.knowledge_json_path)
     if config.function_key:
         logger.info("  filter key     : %s", config.function_key)
     logger.info("=" * 60)
@@ -291,8 +300,21 @@ def run(config: EngineConfig) -> None:
     logger.info("Project: %s  |  base_path: %s", meta.project_name, base_path)
     logger.info("Loaded %d functions from functions.json", len(functions_data))
 
+    # Load project knowledge (optional — built by project_scanner.py)
+    project_knowledge: Optional[ProjectKnowledge] = None
+    if config.knowledge_json_path:
+        project_knowledge = load_knowledge(config.knowledge_json_path)
+        if project_knowledge is None:
+            logger.warning("--knowledge-json file not loaded; continuing without it")
+    else:
+        logger.info("No --knowledge-json provided; running without project knowledge")
+
     # Build PKB
     pkb = _build_pkb(functions_data, config)
+
+    # Attach project knowledge to PKB for richer context packets
+    if project_knowledge:
+        pkb.load_project_knowledge(project_knowledge)
 
     # Apply function-key filter
     if config.function_key:
@@ -357,6 +379,7 @@ def run(config: EngineConfig) -> None:
                 label_generator=label_generator,
                 config=config,
                 base_path=base_path,
+                project_knowledge=project_knowledge,
             )
             fr.flowcharts.append(result)
             if result.error:

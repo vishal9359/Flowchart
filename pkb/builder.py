@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from models import FunctionEntry
+from pkb.knowledge import ProjectKnowledge
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,12 @@ class ProjectKnowledgeBase:
     def __init__(self) -> None:
         self._functions: Dict[str, FunctionEntry] = {}
         self._by_qualified_name: Dict[str, List[str]] = {}
+        self._knowledge: Optional[ProjectKnowledge] = None
+
+    def load_project_knowledge(self, knowledge: ProjectKnowledge) -> None:
+        """Attach a ProjectKnowledge (from project_scanner.py) for richer context."""
+        self._knowledge = knowledge
+        logger.info("Project knowledge attached to PKB: %s", knowledge.stats())
 
     # ------------------------------------------------------------------
     # Construction
@@ -117,14 +124,19 @@ class ProjectKnowledgeBase:
         """
         Construct a concise, LLM-ready context paragraph for a function.
 
-        Contains:
-        - Parameter descriptions
-        - The function's own description (if any)
+        Priority order for function description:
+          1. project_knowledge.json comment (from source — most accurate)
+          2. functions.json description field
+          3. (omitted)
+
+        Also includes:
+        - Parameter types resolved to enum/typedef definitions
         - Signatures + descriptions of all directly called functions
-        - Fallback: source-level comment extraction for unknown callees
+        - Enum / macro context for any types appearing in params
         """
         lines: List[str] = []
 
+        # -- Parameters --
         if func_entry.params:
             param_desc = ", ".join(
                 f"{p.get('type', '')} {p.get('name', '')}".strip()
@@ -132,9 +144,25 @@ class ProjectKnowledgeBase:
             )
             lines.append(f"Parameters: {param_desc}")
 
-        if func_entry.description:
-            lines.append(f"Purpose: {func_entry.description}")
+            # Resolve enum/typedef meanings for parameter types
+            type_context = self._resolve_param_types(func_entry.params)
+            if type_context:
+                lines.append("Parameter type context:")
+                for tc in type_context:
+                    lines.append(f"  {tc}")
 
+        # -- Function purpose: prefer scanner comment over functions.json --
+        purpose = ""
+        if self._knowledge:
+            fk = self._knowledge.functions.get(func_entry.qualified_name)
+            if fk and fk.comment:
+                purpose = fk.comment
+        if not purpose and func_entry.description:
+            purpose = func_entry.description
+        if purpose:
+            lines.append(f"Purpose: {purpose}")
+
+        # -- Called functions --
         callees = self._resolve_callees(func_entry.calls_ids, base_path)
         if callees:
             lines.append("\nCalled functions context:")
@@ -148,9 +176,42 @@ class ProjectKnowledgeBase:
 
         return "\n".join(lines)
 
+    def _resolve_param_types(self, params: List[Dict]) -> List[str]:
+        """
+        For each parameter type, look up enum definitions or typedef meanings
+        from project knowledge and return human-readable descriptions.
+        """
+        if not self._knowledge:
+            return []
+        result = []
+        seen = set()
+        for param in params:
+            raw_type = param.get("type", "")
+            # Extract simple type name (strip pointers, refs, templates)
+            simple = re.sub(r"[*&<> ].*", "", raw_type.split("::")[-1]).strip()
+            if not simple or simple in seen:
+                continue
+            seen.add(simple)
+
+            enum_k = self._knowledge.enums.get(simple)
+            if enum_k:
+                result.append(f"{simple} (enum): {enum_k.summary()}")
+                continue
+
+            typedef_k = self._knowledge.typedefs.get(simple)
+            if typedef_k:
+                result.append(f"{simple}: {typedef_k.summary()}")
+
+        return result
+
     def _resolve_callees(self, calls_ids: List[str],
                          base_path: str) -> List[Dict]:
-        """Resolve callee context from PKB; fall back to source parsing."""
+        """
+        Resolve callee context.  Priority:
+          1. functions.json entry (has full param list)
+          2. project_knowledge.json function comment
+          3. Source file parsing fallback
+        """
         result = []
         for cid in calls_ids:
             entry = self._functions.get(cid)
@@ -159,13 +220,29 @@ class ProjectKnowledgeBase:
                     f"{p.get('type','')} {p.get('name','')}".strip()
                     for p in entry.params
                 )
+                # Prefer scanner comment over functions.json description
+                description = entry.description or ""
+                if self._knowledge:
+                    fk = self._knowledge.functions.get(entry.qualified_name)
+                    if fk and fk.comment:
+                        description = fk.comment
                 result.append({
                     "signature": f"{entry.qualified_name}({param_str})",
-                    "description": entry.description or "",
+                    "description": description,
                     "file": entry.file,
                 })
             else:
-                # Callee not in PKB — attempt to extract from source
+                # Callee not in PKB — try project knowledge then source parsing
+                if self._knowledge:
+                    qname = cid.split("|")[2] if "|" in cid else cid
+                    fk = self._knowledge.functions.get(qname)
+                    if fk:
+                        result.append({
+                            "signature": fk.signature,
+                            "description": fk.comment,
+                            "file": fk.file,
+                        })
+                        continue
                 callee_context = _extract_callee_from_source(cid, base_path)
                 if callee_context:
                     result.append(callee_context)

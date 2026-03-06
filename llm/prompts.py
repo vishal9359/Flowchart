@@ -145,6 +145,7 @@ def _build_node_list(nodes: List[CfgNode]) -> List[Dict]:
 
         # Inject enriched context inline if available
         ctx = node.enriched_context
+
         if ctx.get("function_calls"):
             entry["called_functions"] = [
                 f"{c['signature']}: {c['description']}"
@@ -152,8 +153,21 @@ def _build_node_list(nodes: List[CfgNode]) -> List[Dict]:
                 else c["signature"]
                 for c in ctx["function_calls"]
             ]
+
         if ctx.get("inline_comment"):
             entry["source_comment"] = ctx["inline_comment"]
+
+        # Enum constant meanings (from project_scanner knowledge)
+        if ctx.get("enum_context"):
+            entry["enum_context"] = ctx["enum_context"]
+
+        # Macro constant values
+        if ctx.get("macro_context"):
+            entry["macro_context"] = ctx["macro_context"]
+
+        # Typedef / alias meanings
+        if ctx.get("typedef_context"):
+            entry["typedef_context"] = ctx["typedef_context"]
 
         result.append(entry)
 

@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 
 from models import CfgNode, ControlFlowGraph, FunctionEntry, NodeType
 from pkb.builder import ProjectKnowledgeBase
+from pkb.knowledge import ProjectKnowledge
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +38,11 @@ class NodeEnricher:
     """
 
     def __init__(self, pkb: ProjectKnowledgeBase,
-                 source_lines_by_file: Dict[str, List[str]]) -> None:
+                 source_lines_by_file: Dict[str, List[str]],
+                 knowledge: Optional[ProjectKnowledge] = None) -> None:
         self._pkb = pkb
         self._src: Dict[str, List[str]] = source_lines_by_file
+        self._knowledge: Optional[ProjectKnowledge] = knowledge
 
     # ------------------------------------------------------------------
     # Public API
@@ -75,6 +78,20 @@ class NodeEnricher:
         comment = self._nearest_comment(src_lines, node.start_line)
         if comment:
             ctx["inline_comment"] = comment
+
+        # Enum constant meanings found in raw_code (from project knowledge)
+        if self._knowledge:
+            enum_ctx = self._lookup_enums(node.raw_code)
+            if enum_ctx:
+                ctx["enum_context"] = enum_ctx
+
+            macro_ctx = self._lookup_macros(node.raw_code)
+            if macro_ctx:
+                ctx["macro_context"] = macro_ctx
+
+            typedef_ctx = self._lookup_typedefs(node.raw_code)
+            if typedef_ctx:
+                ctx["typedef_context"] = typedef_ctx
 
         return ctx
 
@@ -151,6 +168,53 @@ class NodeEnricher:
                 break
 
         return " ".join(comment_lines).strip()
+
+
+    # ------------------------------------------------------------------
+    # Project knowledge lookups
+    # ------------------------------------------------------------------
+
+    def _lookup_enums(self, raw_code: str) -> List[str]:
+        """Find enum types and their values referenced in raw_code."""
+        if not self._knowledge:
+            return []
+        results: List[str] = []
+        tokens = set(re.findall(r'\b([A-Za-z_]\w*)\b', raw_code))
+        seen: set = set()
+        for token in tokens:
+            for enum_name, ek in self._knowledge.enums.items():
+                if enum_name in seen:
+                    continue
+                # Match if token is the enum type name, or a value of this enum
+                if token == enum_name or token in ek.values:
+                    seen.add(enum_name)
+                    results.append(f"{enum_name} (enum): {ek.summary()}")
+                    break
+        return results
+
+    def _lookup_macros(self, raw_code: str) -> List[str]:
+        """Find macro constants referenced in raw_code."""
+        if not self._knowledge:
+            return []
+        results: List[str] = []
+        tokens = set(re.findall(r'\b([A-Z_][A-Z0-9_]{2,})\b', raw_code))
+        for token in tokens:
+            mk = self._knowledge.macros.get(token)
+            if mk:
+                results.append(mk.summary())
+        return results
+
+    def _lookup_typedefs(self, raw_code: str) -> List[str]:
+        """Find typedef/using names referenced in raw_code."""
+        if not self._knowledge:
+            return []
+        results: List[str] = []
+        tokens = set(re.findall(r'\b([A-Za-z_]\w*)\b', raw_code))
+        for token in tokens:
+            tk = self._knowledge.typedefs.get(token)
+            if tk:
+                results.append(tk.summary())
+        return results
 
 
 def _extract_inline_comment(line: str) -> str:

@@ -26,6 +26,9 @@ class EngineConfig:
     max_stmts_per_segment: int = 5
     max_lines_per_segment: int = 10
 
+    # Optional: path to project_knowledge.json built by project_scanner.py
+    knowledge_json_path: Optional[str] = None
+
     # LLM call settings
     llm_timeout: int = 120
     llm_max_retries: int = 2

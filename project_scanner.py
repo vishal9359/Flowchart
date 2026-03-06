@@ -31,7 +31,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import clang.cindex as ci
 
@@ -53,7 +53,7 @@ logging.basicConfig(
 logger = logging.getLogger("project_scanner")
 
 # ---------------------------------------------------------------------------
-# Cursor kinds we care about
+# Cursor kinds
 # ---------------------------------------------------------------------------
 
 _FUNCTION_KINDS = frozenset({
@@ -64,14 +64,72 @@ _FUNCTION_KINDS = frozenset({
     ci.CursorKind.FUNCTION_TEMPLATE,
 })
 
+_CONTAINER_KINDS = frozenset({
+    ci.CursorKind.NAMESPACE,
+    ci.CursorKind.CLASS_DECL,
+    ci.CursorKind.STRUCT_DECL,
+    ci.CursorKind.CLASS_TEMPLATE,
+    ci.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
+    ci.CursorKind.UNION_DECL,
+})
+
+# Parse options:
+#   PARSE_DETAILED_PROCESSING_RECORD  — expose MACRO_DEFINITION cursors
+#   PARSE_INCOMPLETE                  — tolerate missing headers/types
+#
+#   PARSE_SKIP_FUNCTION_BODIES is intentionally NOT included.
+#   With that flag, libclang marks out-of-line method definitions as
+#   non-definitions, so is_definition() returns False for methods defined
+#   in .cpp files — which would cause the scanner to miss them entirely.
 _PARSE_OPTIONS = (
     ci.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
-    | ci.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES
     | ci.TranslationUnit.PARSE_INCOMPLETE
 )
 
-# Default C++ file extensions to scan
 _DEFAULT_EXTENSIONS = {".cpp", ".h", ".hpp", ".cc", ".cxx", ".hh", ".h++"}
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+def _norm_path(p: str) -> str:
+    """
+    Normalise a file path for comparison.
+
+    Uses os.path.abspath (makes absolute, collapses ..) WITHOUT following
+    symlinks.  This is critical: libclang reports cursor file names using
+    the same path string that was passed to index.parse().  If we resolve
+    symlinks in one place but not the other, every single cursor would be
+    silently skipped.
+    """
+    try:
+        return os.path.normcase(
+            os.path.normpath(os.path.abspath(str(p)))
+        ).replace("\\", "/")
+    except Exception:
+        return str(p).replace("\\", "/")
+
+
+def _is_system_path(p: str) -> bool:
+    """Return True if p is a system or compiler-internal header."""
+    lp = p.replace("\\", "/").lower()
+    return (
+        lp.startswith("/usr/")
+        or lp.startswith("/lib/")
+        or "/clang/" in lp
+        or "/c++/v1/" in lp
+        or lp.startswith("c:/windows/")
+        or lp.startswith("c:/program files/")
+    )
+
+
+def _relative(abs_path: str, base_path: str) -> str:
+    """Return a relative path, falling back to abs_path if not under base_path."""
+    try:
+        return str(Path(abs_path).relative_to(base_path)).replace("\\", "/")
+    except ValueError:
+        return abs_path.replace("\\", "/")
 
 
 # ---------------------------------------------------------------------------
@@ -79,14 +137,13 @@ _DEFAULT_EXTENSIONS = {".cpp", ".h", ".hpp", ".cc", ".cxx", ".hh", ".h++"}
 # ---------------------------------------------------------------------------
 
 def discover_files(project_dir: str,
-                   extensions: set,
-                   exclude_dirs: set) -> List[Path]:
+                   extensions: Set[str],
+                   exclude_dirs: Set[str]) -> List[Path]:
     """Walk project_dir and return all C++ files, skipping excluded dirs."""
     result: List[Path] = []
     root = Path(project_dir)
 
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune excluded directories in-place so os.walk skips them
         dirnames[:] = [
             d for d in dirnames
             if d not in exclude_dirs and not d.startswith(".")
@@ -97,22 +154,21 @@ def discover_files(project_dir: str,
                 result.append(p)
 
     result.sort()
-    logger.info("Discovered %d C++ files in %s", len(result), project_dir)
+    logger.info("Discovered %d C++ file(s) in %s", len(result), project_dir)
     return result
 
 
 # ---------------------------------------------------------------------------
-# Comment extraction (source-line based)
+# Comment extraction
 # ---------------------------------------------------------------------------
 
 def _preceding_comment(lines: List[str], func_line_idx: int) -> str:
     """
-    Extract the doc comment that immediately precedes the declaration at
-    func_line_idx (0-based).  Handles // and /* */ styles.
+    Extract the doc comment immediately above func_line_idx (0-based).
+    Handles // and /* */ styles.
     """
     i = func_line_idx - 1
 
-    # Skip blank lines
     while i >= 0 and not lines[i].strip():
         i -= 1
 
@@ -121,7 +177,6 @@ def _preceding_comment(lines: List[str], func_line_idx: int) -> str:
 
     line = lines[i].strip()
 
-    # Single-line comments
     if line.startswith("//"):
         comment_lines: List[str] = []
         while i >= 0 and lines[i].strip().startswith("//"):
@@ -129,7 +184,6 @@ def _preceding_comment(lines: List[str], func_line_idx: int) -> str:
             i -= 1
         return " ".join(l for l in comment_lines if l)
 
-    # Block comment ending with */
     if line.endswith("*/"):
         comment_lines = []
         while i >= 0 and "/*" not in lines[i]:
@@ -137,7 +191,6 @@ def _preceding_comment(lines: List[str], func_line_idx: int) -> str:
             if raw and raw != "*/":
                 comment_lines.insert(0, raw)
             i -= 1
-        # Include the opening /* line's content
         if i >= 0:
             opener = re.sub(r"/\*+\s*", "", lines[i]).strip().rstrip("*/").strip()
             if opener:
@@ -160,8 +213,16 @@ def _inline_comment(line: str) -> str:
     return ""
 
 
+def _safe_line(lines: List[str], line_number: int) -> Optional[str]:
+    """Return source line for a 1-based line_number, or None if out of range."""
+    idx = line_number - 1
+    if 0 <= idx < len(lines):
+        return lines[idx]
+    return None
+
+
 # ---------------------------------------------------------------------------
-# Source text extraction (reusing ast_engine.parser logic inline)
+# Source text extraction
 # ---------------------------------------------------------------------------
 
 def _extent_text(lines: List[str],
@@ -184,54 +245,53 @@ def _extent_text(lines: List[str],
 # Per-file knowledge extractor
 # ---------------------------------------------------------------------------
 
-_CONTAINER_KINDS = frozenset({
-    ci.CursorKind.NAMESPACE,
-    ci.CursorKind.CLASS_DECL,
-    ci.CursorKind.STRUCT_DECL,
-    ci.CursorKind.CLASS_TEMPLATE,
-    ci.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
-    ci.CursorKind.UNION_DECL,
-})
-
-
-def _norm_path(p: str) -> str:
-    """Normalise a file path for comparison: forward slashes, resolved symlinks."""
-    try:
-        return str(Path(p).resolve()).replace("\\", "/")
-    except Exception:
-        return p.replace("\\", "/")
-
-
-def _safe_line(lines: List[str], line_number: int) -> Optional[str]:
-    """Return the source line for a 1-based line_number, or None if out of range."""
-    idx = line_number - 1
-    if 0 <= idx < len(lines):
-        return lines[idx]
-    return None
-
-
 class FileKnowledgeExtractor:
     """
     Parses one source file and extracts all knowledge artifacts.
-    Results are accumulated into the provided ProjectKnowledge object.
 
-    Key invariant: every cursor passed to an _extract_* method is
-    guaranteed to belong to the file currently being scanned.
+    Traversal design
+    ────────────────
+    Container cursors (namespace / class / struct):
+        Always recurse — regardless of which file they report as their
+        location.  Why: in C++, a namespace reopened in block_manager.cpp
+        may look like the one first defined in a header.  libclang might
+        report the namespace cursor's location as the header file.
+        Filtering containers by file would cause all method definitions
+        inside that namespace to be silently skipped.
+        System headers are skipped for performance.
+
+    Leaf cursors (function / enum / macro / typedef):
+        Only extract when location.file matches the file being scanned.
+        This prevents duplication when each file is processed separately.
+
+    is_definition() is NOT used as a gate for functions:
+        Method declarations in .h files (is_definition()=False) and
+        out-of-line definitions in .cpp files are both valuable.
+        Additionally, PARSE_SKIP_FUNCTION_BODIES (not used here) causes
+        is_definition() to be unreliable for .cpp definitions.
     """
 
     def __init__(self, index: ci.Index, std: str,
-                 extra_args: List[str]) -> None:
+                 extra_args: List[str],
+                 verbose: bool = False) -> None:
         self._index = index
         self._std = std
         self._extra_args = extra_args
+        self._verbose = verbose
+
+    # ------------------------------------------------------------------
+    # Public entry
+    # ------------------------------------------------------------------
 
     def extract(self, file_path: Path,
                 knowledge: ProjectKnowledge,
                 base_path: str) -> None:
         """Parse file_path and populate knowledge."""
-        abs_path = str(file_path.resolve())
+        # IMPORTANT: use _norm_path (abspath, no symlink resolution) so the
+        # path we pass to index.parse() is the exact same string that
+        # libclang will put in cursor.location.file.name.
+        abs_path = _norm_path(str(file_path))
         rel_path = _relative(abs_path, base_path)
-        abs_path_norm = _norm_path(abs_path)
 
         try:
             lines = file_path.read_text(encoding="utf-8",
@@ -251,38 +311,69 @@ class FileKnowledgeExtractor:
             logger.warning("libclang returned None TU for %s", abs_path)
             return
 
-        self._traverse(tu.cursor, lines, abs_path_norm, rel_path, knowledge)
+        if self._verbose:
+            diags = [d for d in tu.diagnostics
+                     if d.severity >= ci.Diagnostic.Warning]
+            if diags:
+                logger.debug("  %d diagnostic(s) in %s:", len(diags), rel_path)
+                for d in diags[:5]:
+                    logger.debug("    [clang] %s", d.spelling)
+
+        before = (len(knowledge.functions), len(knowledge.enums),
+                  len(knowledge.macros), len(knowledge.typedefs))
+
+        self._traverse(tu.cursor, lines, abs_path, rel_path,
+                       knowledge, visited=set(), depth=0)
+
+        after = (len(knowledge.functions), len(knowledge.enums),
+                 len(knowledge.macros), len(knowledge.typedefs))
+        added = tuple(a - b for a, b in zip(after, before))
+
+        if self._verbose or any(x > 0 for x in added):
+            logger.debug("  %-55s  +func=%-3d +enum=%-3d +macro=%-3d +typedef=%-3d",
+                         rel_path, *added)
 
     # ------------------------------------------------------------------
     # AST traversal
     # ------------------------------------------------------------------
 
     def _traverse(self, cursor: ci.Cursor, lines: List[str],
-                  abs_path_norm: str, rel_path: str,
-                  knowledge: ProjectKnowledge) -> None:
-        """
-        Walk cursor children.  Only cursors whose location.file exactly
-        matches abs_path_norm are processed — cursors from included headers
-        or system files are skipped completely.  This prevents line-index
-        errors that arise when a header's line numbers exceed the current
-        file's line count.
-        """
+                  abs_path: str, rel_path: str,
+                  knowledge: ProjectKnowledge,
+                  visited: Set[int], depth: int) -> None:
+        """Walk the AST, extracting knowledge for the current file."""
+        if depth > 30:
+            return  # safety cap
+
         for child in cursor.get_children():
+            chash = child.hash
+            if chash in visited:
+                continue
+            visited.add(chash)
+
             loc = child.location
+            kind = child.kind
+
+            # ── Containers: always recurse, skip system headers ───────────
+            if kind in _CONTAINER_KINDS:
+                if loc.file and _is_system_path(loc.file.name):
+                    continue
+                self._traverse(child, lines, abs_path, rel_path,
+                                knowledge, visited, depth + 1)
+                continue
+
+            # ── Leaf items: only extract if from THIS file ────────────────
             if not loc.file:
                 continue
 
-            # Exact file match — skip anything from a different file
-            child_file_norm = _norm_path(loc.file.name)
-            if child_file_norm != abs_path_norm:
+            child_file = _norm_path(loc.file.name)
+            if child_file != abs_path:
                 continue
 
-            # Guard: location.line must be valid for our lines array
             if loc.line < 1 or loc.line > len(lines):
                 continue
 
-            kind = child.kind
-
+            # ── Dispatch ──────────────────────────────────────────────────
             if kind == ci.CursorKind.MACRO_DEFINITION:
                 self._extract_macro(child, lines, rel_path, knowledge)
 
@@ -293,13 +384,10 @@ class FileKnowledgeExtractor:
                           ci.CursorKind.TYPE_ALIAS_DECL):
                 self._extract_typedef(child, lines, rel_path, knowledge)
 
-            elif kind in _FUNCTION_KINDS and child.is_definition():
+            elif kind in _FUNCTION_KINDS:
+                # No is_definition() filter — we want both .h declarations
+                # and .cpp definitions for the knowledge base.
                 self._extract_function(child, lines, rel_path, knowledge)
-
-            elif kind in _CONTAINER_KINDS:
-                # Recurse into namespaces / classes — passing same
-                # abs_path_norm so inner cursors are still file-checked
-                self._traverse(child, lines, abs_path_norm, rel_path, knowledge)
 
     # ------------------------------------------------------------------
     # Function extraction
@@ -312,13 +400,18 @@ class FileKnowledgeExtractor:
         if not qname:
             return
 
-        ret = cursor.result_type.spelling if cursor.result_type else ""
-        params = []
+        try:
+            ret = cursor.result_type.spelling if cursor.result_type else ""
+        except Exception:
+            ret = ""
+
+        params: List[str] = []
         for c in cursor.get_children():
             if c.kind == ci.CursorKind.PARM_DECL:
                 ptype = c.type.spelling or ""
                 pname = c.spelling or ""
                 params.append(f"{ptype} {pname}".strip())
+
         sig = f"{ret} {qname}({', '.join(params)})".strip()
 
         line_idx = cursor.location.line - 1
@@ -334,8 +427,15 @@ class FileKnowledgeExtractor:
             line=cursor.location.line,
             comment=comment,
         )
+
         existing = knowledge.functions.get(qname)
-        if existing is None or (not existing.comment and comment):
+        if existing is None:
+            knowledge.functions[qname] = fk
+        elif not existing.comment and comment:
+            # Upgrade to version that has a doc comment
+            knowledge.functions[qname] = fk
+        elif not existing.comment and cursor.is_definition():
+            # Upgrade to the actual definition (has full signature)
             knowledge.functions[qname] = fk
 
     # ------------------------------------------------------------------
@@ -390,8 +490,6 @@ class FileKnowledgeExtractor:
             return
 
         ext = cursor.extent
-
-        # Guard: both start and end lines must be within bounds
         if ext.start.line < 1 or ext.start.line > len(lines):
             return
         if ext.end.line < 1 or ext.end.line > len(lines):
@@ -402,9 +500,10 @@ class FileKnowledgeExtractor:
                                   ext.start.column, ext.end.column)
         value = full_text[len(name):].strip() if full_text.startswith(name) else full_text
 
-        # Skip function-like macros and include guards
+        # Skip function-like macros  e.g. #define MAX(a,b) ...
         if value.startswith("("):
             return
+        # Skip empty macros and include guards  e.g. #define BLOCK_MANAGER_H_
         if not value or re.match(r"^[A-Z_]+_H[_H]?$", name):
             return
 
@@ -461,9 +560,10 @@ class FileKnowledgeExtractor:
 def scan_project(project_dir: str,
                  std: str,
                  clang_args: List[str],
-                 extensions: set,
-                 exclude_dirs: set,
-                 project_name: str = "") -> ProjectKnowledge:
+                 extensions: Set[str],
+                 exclude_dirs: Set[str],
+                 project_name: str = "",
+                 verbose: bool = False) -> ProjectKnowledge:
     """Scan the entire project and return a ProjectKnowledge object."""
     knowledge = ProjectKnowledge(
         project_name=project_name or Path(project_dir).name,
@@ -476,7 +576,7 @@ def scan_project(project_dir: str,
         return knowledge
 
     index = ci.Index.create()
-    extractor = FileKnowledgeExtractor(index, std, clang_args)
+    extractor = FileKnowledgeExtractor(index, std, clang_args, verbose=verbose)
 
     total = len(files)
     for i, file_path in enumerate(files, 1):
@@ -485,21 +585,10 @@ def scan_project(project_dir: str,
         try:
             extractor.extract(file_path, knowledge, project_dir)
         except Exception as exc:
-            logger.error("Error scanning %s: %s", file_path, exc)
+            logger.error("Error scanning %s: %s", file_path, exc, exc_info=verbose)
 
     logger.info("Scan complete — %s", knowledge.stats())
     return knowledge
-
-
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
-def _relative(abs_path: str, base_path: str) -> str:
-    try:
-        return str(Path(abs_path).relative_to(base_path)).replace("\\", "/")
-    except ValueError:
-        return abs_path.replace("\\", "/")
 
 
 # ---------------------------------------------------------------------------
@@ -523,12 +612,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--project-name", default="",
                    help="Project name (defaults to directory name)")
     p.add_argument("--extensions", default=".cpp,.h,.hpp,.cc,.cxx,.hh",
-                   help="Comma-separated file extensions (default: .cpp,.h,.hpp,.cc,.cxx,.hh)")
+                   help="Comma-separated file extensions")
     p.add_argument("--exclude-dirs",
-                   default="build,_build,out,dist,third_party,external,vendor,test,tests,googletest,gtest",
+                   default="build,_build,out,dist,third_party,external,"
+                           "vendor,test,tests,googletest,gtest",
                    help="Comma-separated directory names to skip")
     p.add_argument("--verbose", "-v", action="store_true",
-                   help="Enable debug logging")
+                   help="Enable debug logging (shows per-file extraction counts)")
     return p.parse_args()
 
 
@@ -561,6 +651,7 @@ if __name__ == "__main__":
         extensions=extensions,
         exclude_dirs=exclude_dirs,
         project_name=args.project_name,
+        verbose=args.verbose,
     )
 
     save_knowledge(knowledge, args.out)

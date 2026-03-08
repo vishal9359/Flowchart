@@ -216,7 +216,9 @@ def _process_function(
         tu = tu_parser.get_tu_full(abs_path)
 
         # 3. Resolve function cursor
-        func_cursor = find_function_cursor(tu, func_entry)
+        # Pass abs_path so the resolver can use Strategy 1 (direct position
+        # lookup) and can match loc.file.name against the exact parsed path.
+        func_cursor = find_function_cursor(tu, func_entry, abs_path)
         if func_cursor is None:
             raise RuntimeError(
                 f"Could not resolve cursor for '{qn}' in {func_entry.file}:{func_entry.line}"

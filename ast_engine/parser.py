@@ -135,5 +135,15 @@ class TranslationUnitParser:
         if errors:
             logger.warning("%d error(s) in %s (AST may be incomplete)",
                            len(errors), path)
+            # Log the first few errors at WARNING so the user can see which
+            # headers are missing and add the appropriate --clang-arg=-I flags.
             for d in errors[:5]:
-                logger.debug("  clang: %s", d.spelling)
+                logger.warning("  clang: %s", d.spelling)
+            if len(errors) > 5:
+                logger.warning("  ... and %d more (use --verbose for all)",
+                               len(errors) - 5)
+            if any("file not found" in (d.spelling or "").lower() for d in errors):
+                logger.warning(
+                    "  Hint: add missing include paths via "
+                    "--clang-arg=-I/path/to/headers"
+                )

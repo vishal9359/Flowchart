@@ -14,7 +14,7 @@ class EngineConfig:
     clang_args: List[str] = field(default_factory=list)
 
     llm_url: str = "http://localhost:11434/api/generate"
-    llm_model: str = "llama3"
+    llm_model: str = "gpt-oss"
 
     # Optional: generate flowchart only for this function key
     function_key: Optional[str] = None

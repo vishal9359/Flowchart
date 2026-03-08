@@ -86,7 +86,7 @@ def _parse_args() -> EngineConfig:
                    help="Output directory for JSON files")
     p.add_argument("--llm-url", default="http://localhost:11434/api/generate",
                    help="Local LLM endpoint URL")
-    p.add_argument("--llm-model", default="llama3",
+    p.add_argument("--llm-model", default="gpt-oss",
                    help="LLM model name")
     p.add_argument("--function-key", default=None,
                    help="Process only this function key (optional filter)")

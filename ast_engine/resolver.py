@@ -2,17 +2,20 @@
 Function cursor resolver.
 
 Finds the libclang cursor for a specific C++ function definition inside
-a parsed TranslationUnit using a two-strategy approach:
+a parsed TranslationUnit using a three-strategy approach:
 
   Strategy 1 — Direct position lookup  (fast, parse-error-resilient)
     Uses Cursor.from_location() to jump straight to (file, start_line)
     and walks up through LEXICAL parents until a function-kind cursor is
-    found.  Works even when the TU has parse errors (missing headers) and
-    the cursor extent is truncated.
+    found.  Also handles UNEXPOSED_DECL cursors that arise when the
+    owning class is unresolved (missing header).
 
   Strategy 2 — Full AST traversal  (comprehensive fallback)
-    Walks the AST collecting every function-kind cursor.  Matching uses
-    two independent criteria so that EITHER is sufficient:
+    Walks the AST collecting every function-kind cursor, including
+    UNEXPOSED_DECL cursors whose spelling matches the target function
+    name (error-recovery stand-ins for CXX_METHOD when the class header
+    is missing).  Matching uses two independent criteria so that EITHER
+    is sufficient:
 
       Tight match  — cursor extent fully contains [target_line, target_end].
                      Preferred when the AST is complete.
@@ -21,9 +24,8 @@ a parsed TranslationUnit using a two-strategy approach:
                      the cursor's spelling contains simple_name.
                      Handles truncated extents caused by parse errors: when
                      libclang encounters an unresolved class (missing header)
-                     it still creates a CXX_METHOD cursor whose extent.start
-                     is correct but extent.end stops at the first error inside
-                     the body, well before the real closing brace.
+                     it still creates a cursor whose extent.start is correct
+                     but extent.end stops at the first error inside the body.
 
     Two file-matching sub-strategies:
       a) Normal: loc.file name matches target file.
@@ -33,8 +35,23 @@ a parsed TranslationUnit using a two-strategy approach:
 
     System-header subtrees are skipped for performance.
 
+  Strategy 3 — Broad line-range scan  (last-resort fallback)
+    When Strategies 1 and 2 find no candidates at all (e.g. clang places
+    the method under an UNEXPOSED_DECL with no recognised children), this
+    pass accepts ANY cursor kind that:
+      • lives in the target file (or has null file with ext.start near the
+        target line), AND
+      • has ext.start.line within ±BROAD_SLOP of target_line, AND
+      • whose spelling contains simple_name.
+    A small penalty is applied so Strategy 2 results always win on ties.
+
 Known libclang behaviours addressed here
 -----------------------------------------
+* When a class header is missing (file-not-found include error) libclang
+  creates the method cursor with CursorKind.UNEXPOSED_DECL rather than
+  CXX_METHOD because the owning class is unknown.  Both the position
+  lookup (Strategy 1) and the AST traversal (Strategy 2) now handle this.
+
 * ci.File.from_name(tu, path) requires an exact string match against the
   TU's internal file table.  We try tu.spelling first (the exact path
   libclang used) then abs_path as fallback.
@@ -67,8 +84,24 @@ _FUNCTION_KINDS = frozenset({
     ci.CursorKind.CONVERSION_FUNCTION,
 })
 
+# Cursor kinds that may appear as error-recovery stand-ins for a method
+# definition when the owning class header is missing.  libclang creates
+# UNEXPOSED_DECL in place of CXX_METHOD when the class is unresolved.
+_UNEXPOSED_KINDS = frozenset({
+    ci.CursorKind.UNEXPOSED_DECL,
+})
+
+# Union used wherever we want to consider both real functions and
+# error-recovery unexposed declarations.
+_ALL_CALLABLE_KINDS = _FUNCTION_KINDS | _UNEXPOSED_KINDS
+
 # Lines of tolerance for "loose" start-line matching.
-_START_SLOP = 5
+# Raised from 5 → 10 so that off-by-a-few-lines headers / macros
+# in the function signature don't cause a miss.
+_START_SLOP = 10
+
+# Extra-wide slop used only in the Strategy-3 broad fallback.
+_BROAD_SLOP = 25
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +146,17 @@ def find_function_cursor(tu: ci.TranslationUnit,
     candidates: List[Tuple[int, ci.Cursor]] = []
 
     def _accept(cursor: ci.Cursor) -> None:
-        """Evaluate one function-kind cursor and add to candidates."""
+        """Evaluate one function-kind (or unexposed) cursor and add to candidates."""
+        is_func    = cursor.kind in _FUNCTION_KINDS
+        is_unexposed = cursor.kind in _UNEXPOSED_KINDS
+
+        # For UNEXPOSED_DECL, require that the spelling contains the
+        # simple function name to avoid adding thousands of noisy candidates.
+        if is_unexposed:
+            sp = cursor.spelling or cursor.displayname or ""
+            if simple_name.lower() not in sp.lower():
+                return
+
         loc = cursor.location
         ext = cursor.extent
 
@@ -163,10 +206,13 @@ def find_function_cursor(tu: ci.TranslationUnit,
             score -= 15
         if null_file_match:
             score -= 10
+        # Penalise unexposed-decl matches so real function cursors win when both exist.
+        if is_unexposed:
+            score -= 20
         candidates.append((score, cursor))
 
     def _visit(cursor: ci.Cursor) -> None:
-        if cursor.kind in _FUNCTION_KINDS:
+        if cursor.kind in _ALL_CALLABLE_KINDS:
             _accept(cursor)
 
         # Recurse, skipping system-header subtrees for performance.
@@ -181,17 +227,80 @@ def find_function_cursor(tu: ci.TranslationUnit,
 
     _visit(tu.cursor)
 
-    if not candidates:
-        logger.warning("No cursor found for '%s' (%s:%d-%d)",
-                       func_entry.qualified_name, func_entry.file,
-                       target_line, target_end)
-        return None
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best = candidates[0]
+        logger.debug("Resolved '%s' → cursor '%s' (score=%d)",
+                     func_entry.qualified_name, best.spelling, best_score)
+        return best
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best_score, best = candidates[0]
-    logger.debug("Resolved '%s' → cursor '%s' (score=%d)",
-                 func_entry.qualified_name, best.spelling, best_score)
-    return best
+    # ------------------------------------------------------------------ #
+    #  Strategy 3: broad line-range scan (last resort)                    #
+    # ------------------------------------------------------------------ #
+    # Triggered when Strategies 1 and 2 found nothing — e.g. libclang
+    # places the method under an unusual cursor kind in extreme error-
+    # recovery scenarios.  Accept ANY cursor kind whose location and name
+    # are consistent with the target function.
+    broad_candidates: List[Tuple[int, ci.Cursor]] = []
+
+    def _accept_broad(cursor: ci.Cursor) -> None:
+        loc = cursor.location
+        ext = cursor.extent
+
+        file_ok = False
+        if loc.file is not None:
+            n = _normalise_path(loc.file.name)
+            file_ok = (
+                n.endswith(target_file)
+                or (norm_abs is not None and n == norm_abs)
+            )
+
+        null_ok = (
+            not file_ok
+            and loc.file is None
+            and ext.start.line > 0
+            and abs(ext.start.line - target_line) <= _BROAD_SLOP
+        )
+
+        if not (file_ok or null_ok):
+            return
+
+        spelling = cursor.spelling or cursor.displayname or ""
+        if simple_name.lower() not in spelling.lower():
+            return
+
+        if abs(ext.start.line - target_line) > _BROAD_SLOP:
+            return
+
+        score = _score(cursor, simple_name, target_line, target_end) - 50
+        broad_candidates.append((score, cursor))
+
+    def _visit_broad(cursor: ci.Cursor) -> None:
+        _accept_broad(cursor)
+        for child in cursor.get_children():
+            try:
+                cl = child.location
+                if cl.file is not None and cl.is_in_system_header:
+                    continue
+            except Exception:
+                pass
+            _visit_broad(child)
+
+    _visit_broad(tu.cursor)
+
+    if broad_candidates:
+        broad_candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best = broad_candidates[0]
+        logger.debug(
+            "Resolved '%s' via broad scan → cursor kind=%s spelling='%s' (score=%d)",
+            func_entry.qualified_name, best.kind, best.spelling, best_score,
+        )
+        return best
+
+    logger.warning("No cursor found for '%s' (%s:%d-%d)",
+                   func_entry.qualified_name, func_entry.file,
+                   target_line, target_end)
+    return None
 
 
 def get_function_body(cursor: ci.Cursor) -> Optional[ci.Cursor]:
@@ -227,6 +336,8 @@ def _position_lookup(tu: ci.TranslationUnit,
       name match only.
     * Probe multiple lines and columns so we land inside the function even
       if the first line is a macro, annotation, or blank.
+    * Accept UNEXPOSED_DECL cursors with matching name — these appear when
+      the owning class header is missing (clang error-recovery).
     """
     # Build list of filenames to try with File.from_name.
     # tu.spelling is the path libclang stored internally; try it first.
@@ -244,6 +355,8 @@ def _position_lookup(tu: ci.TranslationUnit,
         (target_line + 1, 5),
         (target_line + 2, 5),
         (target_line + 3, 5),
+        (target_line + 4, 5),
+        (target_line + 5, 5),
     ]
 
     for filename in candidates_filenames:
@@ -306,19 +419,26 @@ def _is_function_match(cursor: ci.Cursor,
                        simple_name: str,
                        target_line: int) -> bool:
     """
-    True if cursor is a function-kind cursor whose start line is near
-    target_line AND whose spelling contains simple_name.
+    True if cursor is a function-kind (or matching unexposed-decl) cursor
+    whose start line is near target_line AND whose spelling contains
+    simple_name.
 
     Deliberately does NOT check extent.end so truncated extents
     (from parse errors) are still accepted.
     """
     try:
-        if cursor.kind not in _FUNCTION_KINDS:
+        is_func     = cursor.kind in _FUNCTION_KINDS
+        is_unexposed = cursor.kind in _UNEXPOSED_KINDS
+        if not (is_func or is_unexposed):
             return False
         ext = cursor.extent
         if abs(ext.start.line - target_line) > _START_SLOP:
             return False
         spelling = cursor.spelling or cursor.displayname or ""
+        # For unexposed decls require that the simple name appears in the
+        # spelling to avoid accepting arbitrary unexposed nodes.
+        if is_unexposed and simple_name.lower() not in spelling.lower():
+            return False
         return (spelling == simple_name
                 or simple_name.lower() in spelling.lower())
     except Exception:

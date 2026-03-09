@@ -48,9 +48,14 @@ a parsed TranslationUnit using a three-strategy approach:
 Known libclang behaviours addressed here
 -----------------------------------------
 * When a class header is missing (file-not-found include error) libclang
-  creates the method cursor with CursorKind.UNEXPOSED_DECL rather than
-  CXX_METHOD because the owning class is unknown.  Both the position
-  lookup (Strategy 1) and the AST traversal (Strategy 2) now handle this.
+  may create the method cursor with CursorKind.UNEXPOSED_DECL rather than
+  CXX_METHOD because the owning class is unknown.  Strategies 1 and 2
+  handle this via _UNEXPOSED_KINDS.
+
+* In some clang versions / error-recovery paths the method cursor has
+  loc.file pointing to the *missing header* (not the .cpp being parsed).
+  Strategy 3 therefore does NOT hard-reject on file mismatch; it only
+  applies a score penalty so correctly-located cursors still win.
 
 * ci.File.from_name(tu, path) requires an exact string match against the
   TU's internal file table.  We try tu.spelling first (the exact path
@@ -244,35 +249,42 @@ def find_function_cursor(tu: ci.TranslationUnit,
     broad_candidates: List[Tuple[int, ci.Cursor]] = []
 
     def _accept_broad(cursor: ci.Cursor) -> None:
-        loc = cursor.location
+        """
+        Last-resort acceptance: require only function kind + name + line
+        proximity.  File matching is intentionally relaxed here because clang
+        error-recovery can assign loc.file to the *missing* header rather than
+        the .cpp being parsed, which would wrongly reject valid cursors in the
+        tighter strategies above.
+        """
+        # Only accept callable-kind cursors to avoid expression noise.
+        if cursor.kind not in _ALL_CALLABLE_KINDS:
+            return
+
         ext = cursor.extent
 
-        file_ok = False
-        if loc.file is not None:
-            n = _normalise_path(loc.file.name)
-            file_ok = (
-                n.endswith(target_file)
-                or (norm_abs is not None and n == norm_abs)
-            )
+        # A zero start-line is a sentinel for an invalid/phantom cursor.
+        if ext.start.line == 0:
+            return
 
-        null_ok = (
-            not file_ok
-            and loc.file is None
-            and ext.start.line > 0
-            and abs(ext.start.line - target_line) <= _BROAD_SLOP
-        )
-
-        if not (file_ok or null_ok):
+        if abs(ext.start.line - target_line) > _BROAD_SLOP:
             return
 
         spelling = cursor.spelling or cursor.displayname or ""
         if simple_name.lower() not in spelling.lower():
             return
 
-        if abs(ext.start.line - target_line) > _BROAD_SLOP:
-            return
+        # Penalise cursors whose file clearly doesn't match the target .cpp.
+        # We don't *reject* them — just score them lower — because clang may
+        # have set loc.file to the (missing) header under error-recovery.
+        file_penalty = 0
+        loc = cursor.location
+        if loc.file is not None:
+            n = _normalise_path(loc.file.name)
+            if not (n.endswith(target_file)
+                    or (norm_abs is not None and n == norm_abs)):
+                file_penalty = 30
 
-        score = _score(cursor, simple_name, target_line, target_end) - 50
+        score = _score(cursor, simple_name, target_line, target_end) - 50 - file_penalty
         broad_candidates.append((score, cursor))
 
     def _visit_broad(cursor: ci.Cursor) -> None:

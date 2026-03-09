@@ -51,7 +51,9 @@ class ProjectKnowledgeBase:
                 file=location.get("file", ""),
                 line=location.get("line", 0),
                 end_line=location.get("endLine", 0),
-                params=data.get("params", []),
+                # functions.json uses "parameters"; cache serialisation uses
+                # "params".  Accept either so both sources work correctly.
+                params=data.get("parameters", data.get("params", [])),
                 calls_ids=data.get("callsIds", []),
                 called_by_ids=data.get("calledByIds", []),
                 interface_id=data.get("interfaceId", ""),

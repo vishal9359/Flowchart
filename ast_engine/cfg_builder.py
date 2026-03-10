@@ -14,7 +14,7 @@ Rules (ABSOLUTE — never change):
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import clang.cindex as ci
 
@@ -375,56 +375,106 @@ class CFGBuilder:
 
     def _process_switch_body(self, sw_id: str,
                               body: ci.Cursor) -> Tuple[OpenExits, List[str]]:
-        """Process the COMPOUND_STMT body of a switch statement."""
+        """
+        Process the COMPOUND_STMT of a switch statement.
+
+        No intermediate CASE/DEFAULT_CASE nodes are created.  Instead the
+        switch head connects directly to the first statement of each case
+        body.  The case value appears only as the Mermaid edge label, which
+        avoids the redundancy of having both an edge labelled "case 1" AND
+        a box labelled "Case: 1".
+
+        Fallthrough is handled in two ways:
+          1. Empty case (no body statements): its edge label is accumulated
+             and attached to the next non-empty case's first statement node,
+             producing  sw -->|case 1| N  and  sw -->|case 2| N  for the
+             same node N.
+          2. Fall-through body (previous case has statements but no break):
+             a direct edge is added from the last node of the previous case
+             body to the first node of the next, matching C++ semantics.
+        """
+        cases = self._flatten_switch_cases(body)
+
         open_exits: OpenExits = []
         all_rets: List[str] = []
-        prev_open: OpenExits = []   # fallthrough from previous case
+        prev_open: OpenExits = []       # open exits carried forward for fallthrough
+        pending_labels: List[str] = []  # edge labels waiting for next non-empty case
 
-        for child in body.get_children():
-            if child.kind == ci.CursorKind.CASE_STMT:
-                case_children = list(child.get_children())
-                val_cursor = case_children[0] if case_children else None
-                val_text = self._src_text(val_cursor) if val_cursor else "?"
+        for label, body_stmts in cases:
+            pending_labels.append(label)
 
-                case_node = self._new_node(NodeType.CASE, val_text,
-                                           child.extent.start.line,
-                                           child.extent.start.line)
-                self._edge(sw_id, case_node.node_id, f"case {val_text}")
-                # Fallthrough from prior case
-                self._connect_open(prev_open, case_node.node_id)
+            if body_stmts:
+                e, opens, rets, brks, _ = self._process_case_stmts(body_stmts)
+                if e is not None:
+                    # Connect switch head → first body node for every accumulated label
+                    for lbl in pending_labels:
+                        self._edge(sw_id, e, lbl)
+                    pending_labels = []
+                    # Connect fallthrough from previous case body (if any)
+                    self._connect_open(prev_open, e)
+                all_rets.extend(rets)
+                open_exits.extend([(b, None) for b in brks])
+                prev_open = opens
+            # else: empty case — accumulate label, keep prev_open unchanged
 
-                body_stmts = case_children[1:]
-                if body_stmts:
-                    e, opens, rets, brks, _ = self._process_case_stmts(body_stmts)
-                    if e:
-                        self._edge(case_node.node_id, e)
-                    all_rets.extend(rets)
-                    open_exits.extend([(b, None) for b in brks])
-                    prev_open = opens
-                else:
-                    prev_open = [(case_node.node_id, None)]
+        # Trailing empty cases (no body at all) exit directly after the switch
+        for lbl in pending_labels:
+            open_exits.append((sw_id, lbl))
 
-            elif child.kind == ci.CursorKind.DEFAULT_STMT:
-                def_children = list(child.get_children())
-                def_node = self._new_node(NodeType.DEFAULT_CASE, "default",
-                                          child.extent.start.line,
-                                          child.extent.start.line)
-                self._edge(sw_id, def_node.node_id, "default")
-                self._connect_open(prev_open, def_node.node_id)
-
-                if def_children:
-                    e, opens, rets, brks, _ = self._process_case_stmts(def_children)
-                    if e:
-                        self._edge(def_node.node_id, e)
-                    all_rets.extend(rets)
-                    open_exits.extend([(b, None) for b in brks])
-                    prev_open = opens
-                else:
-                    prev_open = [(def_node.node_id, None)]
-
-        # Last case without break falls through to after-switch
+        # Last case without a break falls through to after-switch
         open_exits.extend(prev_open)
         return open_exits, all_rets
+
+    def _flatten_switch_cases(
+            self,
+            body: ci.Cursor,
+    ) -> List[Tuple[str, List[ci.Cursor]]]:
+        """
+        Flatten the COMPOUND_STMT of a switch into an ordered list of
+        (edge_label, body_stmts) pairs.
+
+        libclang represents consecutive empty fallthrough cases by nesting:
+            case 1:          →  CASE_STMT(1)  children: [val=1, CASE_STMT(2)]
+            case 2: stmt;    →  CASE_STMT(2)  children: [val=2, stmt]
+
+        Recursing through this nesting gives a flat, ordered list that
+        _process_switch_body can iterate uniformly.
+        """
+        result: List[Tuple[str, List[ci.Cursor]]] = []
+
+        def collect(cursor: ci.Cursor) -> None:
+            if cursor.kind == ci.CursorKind.CASE_STMT:
+                children = list(cursor.get_children())
+                val_text = self._src_text(children[0]) if children else "?"
+                label = f"case {val_text}"
+                stmts: List[ci.Cursor] = []
+                for c in children[1:]:
+                    if c.kind in (ci.CursorKind.CASE_STMT,
+                                  ci.CursorKind.DEFAULT_STMT):
+                        result.append((label, stmts))
+                        collect(c)   # recurse into nested case/default
+                        return
+                    stmts.append(c)
+                result.append((label, stmts))
+
+            elif cursor.kind == ci.CursorKind.DEFAULT_STMT:
+                children = list(cursor.get_children())
+                stmts = []
+                for c in children:
+                    if c.kind in (ci.CursorKind.CASE_STMT,
+                                  ci.CursorKind.DEFAULT_STMT):
+                        result.append(("default", stmts))
+                        collect(c)
+                        return
+                    stmts.append(c)
+                result.append(("default", stmts))
+
+        for child in body.get_children():
+            if child.kind in (ci.CursorKind.CASE_STMT,
+                              ci.CursorKind.DEFAULT_STMT):
+                collect(child)
+
+        return result
 
     def _process_case_stmts(self, stmts: List[ci.Cursor]):
         """Process statement list inside a case body (may contain sub-control-flow)."""

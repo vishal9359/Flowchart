@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 _CALL_PATTERN = re.compile(r'(\w[\w:~<>]*)\s*\(')
 # Patterns for simple variable declarations: type varname = ...
 _DECL_PATTERN = re.compile(r'(\w[\w:*&<> ]+?)\s+(\w+)\s*[=;{(]')
+# Patterns that identify a struct/class member access: obj.field  or  ptr->field
+_MEMBER_ACCESS_RE = re.compile(r'\b\w+\s*(?:\.|->)\s*(\w+)')
 
 
 class NodeEnricher:
@@ -92,6 +94,10 @@ class NodeEnricher:
             typedef_ctx = self._lookup_typedefs(node.raw_code)
             if typedef_ctx:
                 ctx["typedef_context"] = typedef_ctx
+
+            struct_ctx = self._lookup_struct_members(node.raw_code)
+            if struct_ctx:
+                ctx["struct_member_context"] = struct_ctx
 
         return ctx
 
@@ -214,6 +220,31 @@ class NodeEnricher:
             tk = self._knowledge.typedefs.get(token)
             if tk:
                 results.append(tk.summary())
+        return results
+
+    def _lookup_struct_members(self, raw_code: str) -> List[str]:
+        """
+        Find struct/class member accesses (obj.field, ptr->field) in raw_code
+        and return descriptions for the accessed fields from the knowledge base.
+
+        Only member names that appear in at least one known struct are included,
+        keeping the context concise and noise-free.
+        """
+        if not self._knowledge or not self._knowledge.structs:
+            return []
+        results: List[str] = []
+        seen: set = set()
+        for match in _MEMBER_ACCESS_RE.finditer(raw_code):
+            member_name = match.group(1)
+            if member_name in seen:
+                continue
+            for sk in self._knowledge.structs.values():
+                if member_name in sk.members:
+                    summary = sk.member_summary(member_name)
+                    if summary:
+                        results.append(summary)
+                    seen.add(member_name)
+                    break   # first matching struct wins; avoids duplicate entries
         return results
 
 

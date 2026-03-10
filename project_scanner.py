@@ -41,6 +41,8 @@ from pkb.knowledge import (
     FunctionKnowledge,
     MacroKnowledge,
     ProjectKnowledge,
+    StructKnowledge,
+    StructMemberKnowledge,
     TypedefKnowledge,
     save_knowledge,
 )
@@ -221,6 +223,33 @@ def _safe_line(lines: List[str], line_number: int) -> Optional[str]:
     return None
 
 
+def _funclike_macro_body(value: str) -> str:
+    """
+    Given the text after a function-like macro name  — which starts with
+    the parameter list  e.g. '(eventid, ...) logger()->iboflog(...)'  —
+    return the expansion body (the part after the closing ')').
+
+    Continuation backslashes and excess whitespace are normalised so the
+    result is a compact single-line string suitable for LLM context.
+    Returns an empty string if no body follows the parameter list.
+    """
+    if not value.startswith("("):
+        return value
+    depth = 0
+    for i, ch in enumerate(value):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                body = value[i + 1:]
+                # Remove line-continuation backslashes and collapse whitespace
+                body = re.sub(r"\\\s*\n\s*", " ", body)
+                body = re.sub(r"\s+", " ", body).strip()
+                return body[:200]
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Source text extraction
 # ---------------------------------------------------------------------------
@@ -320,18 +349,22 @@ class FileKnowledgeExtractor:
                     logger.debug("    [clang] %s", d.spelling)
 
         before = (len(knowledge.functions), len(knowledge.enums),
-                  len(knowledge.macros), len(knowledge.typedefs))
+                  len(knowledge.macros), len(knowledge.typedefs),
+                  len(knowledge.structs))
 
         self._traverse(tu.cursor, lines, abs_path, rel_path,
                        knowledge, visited=set(), depth=0)
 
         after = (len(knowledge.functions), len(knowledge.enums),
-                 len(knowledge.macros), len(knowledge.typedefs))
+                 len(knowledge.macros), len(knowledge.typedefs),
+                 len(knowledge.structs))
         added = tuple(a - b for a, b in zip(after, before))
 
         if self._verbose or any(x > 0 for x in added):
-            logger.debug("  %-55s  +func=%-3d +enum=%-3d +macro=%-3d +typedef=%-3d",
-                         rel_path, *added)
+            logger.debug(
+                "  %-55s  +func=%-3d +enum=%-3d +macro=%-3d +typedef=%-3d +struct=%-3d",
+                rel_path, *added,
+            )
 
     # ------------------------------------------------------------------
     # AST traversal
@@ -360,6 +393,12 @@ class FileKnowledgeExtractor:
                     continue
                 self._traverse(child, lines, abs_path, rel_path,
                                 knowledge, visited, depth + 1)
+                # For struct/class definitions in THIS file, also extract members
+                if kind in (ci.CursorKind.CLASS_DECL, ci.CursorKind.STRUCT_DECL):
+                    if (loc.file
+                            and _norm_path(loc.file.name) == abs_path
+                            and child.is_definition()):
+                        self._extract_struct(child, lines, rel_path, knowledge)
                 continue
 
             # ── Leaf items: only extract if from THIS file ────────────────
@@ -500,11 +539,21 @@ class FileKnowledgeExtractor:
                                   ext.start.column, ext.end.column)
         value = full_text[len(name):].strip() if full_text.startswith(name) else full_text
 
-        # Skip function-like macros  e.g. #define MAX(a,b) ...
-        if value.startswith("("):
+        # Skip include guards  e.g. #define BLOCK_MANAGER_H_
+        if re.match(r"^[A-Z_]+_H[_H]?$", name):
             return
-        # Skip empty macros and include guards  e.g. #define BLOCK_MANAGER_H_
-        if not value or re.match(r"^[A-Z_]+_H[_H]?$", name):
+
+        # For function-like macros  e.g. #define TRACE_DEBUG(id, ...)  body...
+        # Extract the expansion body (everything after the closing ')' of the
+        # parameter list) so the LLM receives the actual macro behaviour rather
+        # than a raw parameter signature.
+        if value.startswith("("):
+            value = _funclike_macro_body(value)
+            if not value:
+                return   # empty expansion (e.g. guard macros disabled by #ifdef)
+
+        # Skip macros with no value after normalisation
+        if not value:
             return
 
         src_line = _safe_line(lines, ext.start.line)
@@ -551,6 +600,68 @@ class FileKnowledgeExtractor:
             file=rel_path,
             comment=comment,
         )
+
+    # ------------------------------------------------------------------
+    # Struct / class member extraction
+    # ------------------------------------------------------------------
+
+    def _extract_struct(self, cursor: ci.Cursor, lines: List[str],
+                         rel_path: str,
+                         knowledge: ProjectKnowledge) -> None:
+        """
+        Extract field member declarations from a CLASS_DECL or STRUCT_DECL.
+
+        For each FIELD_DECL child, records:
+          - field name
+          - declared type spelling
+          - inline or preceding comment
+
+        The result is stored under both the qualified name and the simple
+        (unqualified) name so the enricher can look up members by either.
+        """
+        qname = cursor.type.spelling or cursor.spelling
+        if not qname or qname.startswith("("):
+            return
+
+        line_idx = cursor.location.line - 1
+        struct_comment = _preceding_comment(lines, line_idx)
+
+        members: Dict[str, StructMemberKnowledge] = {}
+        for child in cursor.get_children():
+            if child.kind != ci.CursorKind.FIELD_DECL:
+                continue
+            field_name = child.spelling
+            if not field_name:
+                continue
+            field_type = child.type.spelling or ""
+            field_line = child.location.line
+
+            comment = ""
+            src_line = _safe_line(lines, field_line)
+            if src_line:
+                comment = _inline_comment(src_line)
+            if not comment and field_line > 0:
+                comment = _preceding_comment(lines, field_line - 1)
+
+            members[field_name] = StructMemberKnowledge(
+                field_type=field_type,
+                comment=comment,
+            )
+
+        if not members:
+            return
+
+        sk = StructKnowledge(
+            qualified_name=qname,
+            file=rel_path,
+            comment=struct_comment,
+            members=members,
+        )
+        knowledge.structs[qname] = sk
+        # Also index by simple (unqualified) name for easy lookup
+        simple = qname.split("::")[-1].split("<")[0].strip()
+        if simple and simple != qname:
+            knowledge.structs[simple] = sk
 
 
 # ---------------------------------------------------------------------------

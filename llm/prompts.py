@@ -35,10 +35,17 @@ You have full context of the project: function purpose, called function descript
    - Use <br/> to separate distinct actions if the node contains multiple statements.
    - Maximum 3 lines per label.
    - Preserve exact function call names exactly as they appear in code.
+   - For assignment statements (obj.field = val, var = expr), write as:
+       "Set <left-hand side description> to <right-hand side description>"
+     Example: "prt.repFactor = repFactor" → "Set partition replication factor to repFactor"
+   - For format strings containing positional placeholders ({}, {0}, %s, %d, etc.),
+     replace each placeholder with the corresponding argument variable name.
+     Example: TRACE_DEBUG("Item {} active", ldu) → "Log debug: Item ldu active"
 
 3. DECISION nodes  (if-conditions, loop conditions, switch)
    - Must be phrased as a Yes/No question ending with "?".
    - Keep it concise — one line if possible.
+   - If context provides the meaning of a constant (e.g. macro value), use it.
    - Example: "Is rate limit exceeded for this event?"
 
 4. LOOP_HEAD nodes  (for / while / do-while conditions)
@@ -49,27 +56,25 @@ You have full context of the project: function purpose, called function descript
    - Describe what is being switched on.
    - Example: "Based on event type?"
 
-6. CASE / DEFAULT_CASE nodes
-   - State the case value in plain English.
-   - Example: "Case: BackendEvent::GC" or "Default case"
-
-7. RETURN nodes
+6. RETURN nodes
    - Format: "Return <what is returned>"
    - Example: "Return true (limit exceeded)" or "Return nullptr"
 
-8. TRY_HEAD nodes
+7. TRY_HEAD nodes
    - Label: "Execute with exception handling"
 
-9. CATCH nodes
+8. CATCH nodes
    - Format: "Handle <exception type> exception"
 
-10. BREAK / CONTINUE
-    - Label: "Exit loop" for break, "Continue to next iteration" for continue
+9. BREAK / CONTINUE
+   - Label: "Exit loop" for break, "Continue to next iteration" for continue
 
 === STRICT RULES (NEVER VIOLATE) ===
 - Never rename or paraphrase function call names.
 - Never invent logic not present in the source code.
 - Use project terminology exactly as provided in the context section.
+- When struct_member_context is provided, use the member descriptions to enrich labels.
+- When macro_context is provided, use the macro value/meaning to enrich labels.
 - Do not add explanatory text outside the label itself.
 
 === OUTPUT FORMAT ===
@@ -168,6 +173,10 @@ def _build_node_list(nodes: List[CfgNode]) -> List[Dict]:
         # Typedef / alias meanings
         if ctx.get("typedef_context"):
             entry["typedef_context"] = ctx["typedef_context"]
+
+        # Struct/class member field meanings
+        if ctx.get("struct_member_context"):
+            entry["struct_member_context"] = ctx["struct_member_context"]
 
         result.append(entry)
 

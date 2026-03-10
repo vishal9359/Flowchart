@@ -94,6 +94,36 @@ class TypedefKnowledge:
 
 
 @dataclass
+class StructMemberKnowledge:
+    """One field/member variable inside a struct or class."""
+    field_type: str
+    comment: str = ""
+
+    def summary(self, field_name: str) -> str:
+        desc = f"{field_name}: {self.field_type}"
+        if self.comment:
+            desc += f"  ({self.comment})"
+        return desc
+
+
+@dataclass
+class StructKnowledge:
+    """A C++ struct or class with its member variable declarations."""
+    qualified_name: str
+    file: str
+    comment: str = ""
+    members: Dict[str, StructMemberKnowledge] = field(default_factory=dict)
+
+    def member_summary(self, member_name: str) -> str:
+        """Return a compact description of one member for LLM injection."""
+        m = self.members.get(member_name)
+        if not m:
+            return ""
+        base = f"{self.qualified_name}::{member_name} ({m.field_type})"
+        return base + (f"  [{m.comment}]" if m.comment else "")
+
+
+@dataclass
 class ProjectKnowledge:
     project_name: str = ""
     base_path: str = ""
@@ -105,14 +135,18 @@ class ProjectKnowledge:
     macros: Dict[str, MacroKnowledge] = field(default_factory=dict)
     # Keyed by typedef/alias name
     typedefs: Dict[str, TypedefKnowledge] = field(default_factory=dict)
+    # Keyed by simple or qualified struct/class name
+    structs: Dict[str, StructKnowledge] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         return (not self.functions and not self.enums
-                and not self.macros and not self.typedefs)
+                and not self.macros and not self.typedefs
+                and not self.structs)
 
     def stats(self) -> str:
         return (f"functions={len(self.functions)}, enums={len(self.enums)}, "
-                f"macros={len(self.macros)}, typedefs={len(self.typedefs)}")
+                f"macros={len(self.macros)}, typedefs={len(self.typedefs)}, "
+                f"structs={len(self.structs)}")
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +197,18 @@ def save_knowledge(knowledge: ProjectKnowledge, path: str) -> None:
                 "comment": v.comment,
             }
             for k, v in knowledge.typedefs.items()
+        },
+        "structs": {
+            k: {
+                "qualifiedName": v.qualified_name,
+                "file": v.file,
+                "comment": v.comment,
+                "members": {
+                    mk: {"type": mv.field_type, "comment": mv.comment}
+                    for mk, mv in v.members.items()
+                },
+            }
+            for k, v in knowledge.structs.items()
         },
     }
     out = Path(path)
@@ -229,6 +275,21 @@ def load_knowledge(path: str) -> Optional[ProjectKnowledge]:
             underlying=v.get("underlying", ""),
             file=v.get("file", ""),
             comment=v.get("comment", ""),
+        )
+
+    for key, v in data.get("structs", {}).items():
+        members = {
+            mk: StructMemberKnowledge(
+                field_type=mv.get("type", ""),
+                comment=mv.get("comment", ""),
+            )
+            for mk, mv in v.get("members", {}).items()
+        }
+        k.structs[key] = StructKnowledge(
+            qualified_name=v.get("qualifiedName", key),
+            file=v.get("file", ""),
+            comment=v.get("comment", ""),
+            members=members,
         )
 
     logger.info("Project knowledge loaded: %s  (%s)", path, k.stats())

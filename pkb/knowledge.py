@@ -2,10 +2,12 @@
 ProjectKnowledge — data structures and loader for project_scanner.py output.
 
 Holds the rich semantic context extracted by scanning the entire C++ project:
-  - Function signatures + doc comments (from source, not functions.json)
+  - Function signatures + doc comments + call graph (project-only calls)
   - Enum declarations with all values + per-value comments
   - #define macro definitions with values + comments
   - typedef / using type aliases with underlying types + comments
+  - struct / class member field declarations
+  - Hierarchical summaries: project → module → file → function
 
 Used by ProjectKnowledgeBase.build_context_packet() and NodeEnricher
 to inject project-vocabulary into LLM prompts.
@@ -15,7 +17,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,9 @@ class FunctionKnowledge:
     file: str
     line: int
     comment: str = ""
+    # Qualified names of project functions this function calls (non-system).
+    # Populated by project_scanner.py via CALL_EXPR traversal.
+    calls: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -73,9 +78,27 @@ class MacroKnowledge:
     comment: str = ""
 
     def summary(self) -> str:
-        desc = f"{self.name} = {self.value}"
+        # Classify intent from expansion body keywords
+        v = self.value.lower()
+        intent = ""
+        if "level::err" in v or "level::critical" in v or "level::warn" in v:
+            intent = "error/warning logging macro"
+        elif "level::info" in v:
+            intent = "info logging macro"
+        elif "level::debug" in v or "level::trace" in v:
+            intent = "debug logging macro"
+        elif "assert" in v:
+            intent = "assertion macro"
+        elif "throw" in v or "exception" in v:
+            intent = "exception-throwing macro"
+
+        desc = f"{self.name}"
+        if intent:
+            desc += f" ({intent})"
+        elif self.value and len(self.value) < 60:
+            desc += f" = {self.value}"
         if self.comment:
-            desc += f"  ({self.comment})"
+            desc += f"  [{self.comment}]"
         return desc
 
 
@@ -127,6 +150,14 @@ class StructKnowledge:
 class ProjectKnowledge:
     project_name: str = ""
     base_path: str = ""
+
+    # Hierarchical summaries (populated by --llm-summarize in project_scanner.py)
+    project_summary: str = ""
+    # Keyed by module/directory relative path (e.g. "src/qos")
+    module_summaries: Dict[str, str] = field(default_factory=dict)
+    # Keyed by relative file path (e.g. "src/qos/qos_manager.cpp")
+    file_summaries: Dict[str, str] = field(default_factory=dict)
+
     # Keyed by qualified_name
     functions: Dict[str, FunctionKnowledge] = field(default_factory=dict)
     # Keyed by simple or qualified enum name
@@ -144,9 +175,14 @@ class ProjectKnowledge:
                 and not self.structs)
 
     def stats(self) -> str:
-        return (f"functions={len(self.functions)}, enums={len(self.enums)}, "
-                f"macros={len(self.macros)}, typedefs={len(self.typedefs)}, "
-                f"structs={len(self.structs)}")
+        return (
+            f"functions={len(self.functions)}, enums={len(self.enums)}, "
+            f"macros={len(self.macros)}, typedefs={len(self.typedefs)}, "
+            f"structs={len(self.structs)}, "
+            f"file_summaries={len(self.file_summaries)}, "
+            f"module_summaries={len(self.module_summaries)}, "
+            f"project_summary={'yes' if self.project_summary else 'no'}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +194,9 @@ def save_knowledge(knowledge: ProjectKnowledge, path: str) -> None:
     data = {
         "project_name": knowledge.project_name,
         "base_path": knowledge.base_path,
+        "project_summary": knowledge.project_summary,
+        "module_summaries": knowledge.module_summaries,
+        "file_summaries": knowledge.file_summaries,
         "functions": {
             k: {
                 "qualifiedName": v.qualified_name,
@@ -165,6 +204,7 @@ def save_knowledge(knowledge: ProjectKnowledge, path: str) -> None:
                 "file": v.file,
                 "line": v.line,
                 "comment": v.comment,
+                "calls": v.calls,
             }
             for k, v in knowledge.functions.items()
         },
@@ -215,8 +255,7 @@ def save_knowledge(knowledge: ProjectKnowledge, path: str) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    logger.info("Project knowledge saved: %s  (%s)", path,
-                knowledge.stats())
+    logger.info("Project knowledge saved: %s  (%s)", path, knowledge.stats())
 
 
 def load_knowledge(path: str) -> Optional[ProjectKnowledge]:
@@ -235,6 +274,9 @@ def load_knowledge(path: str) -> Optional[ProjectKnowledge]:
     k = ProjectKnowledge(
         project_name=data.get("project_name", ""),
         base_path=data.get("base_path", ""),
+        project_summary=data.get("project_summary", ""),
+        module_summaries=data.get("module_summaries", {}),
+        file_summaries=data.get("file_summaries", {}),
     )
 
     for key, v in data.get("functions", {}).items():
@@ -244,6 +286,7 @@ def load_knowledge(path: str) -> Optional[ProjectKnowledge]:
             file=v.get("file", ""),
             line=v.get("line", 0),
             comment=v.get("comment", ""),
+            calls=v.get("calls", []),
         )
 
     for key, v in data.get("enums", {}).items():

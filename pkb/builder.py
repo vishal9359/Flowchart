@@ -3,18 +3,30 @@ Project Knowledge Base (PKB) builder.
 
 Builds a structured lookup of all functions in functions.json.
 Provides context packets for LLM label generation so every function's
-LLM call includes relevant project-specific knowledge.
+LLM call includes:
+
+  1. Hierarchical project context   (project → module → file → function)
+  2. 4-level callee call-graph      (BFS up to depth 4, project-only, deduplicated)
+  3. Parameter type resolution      (enum + typedef meanings from project_knowledge)
 """
 
 import logging
 import re
+from collections import deque
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 from models import FunctionEntry
-from pkb.knowledge import ProjectKnowledge
+from pkb.knowledge import FunctionKnowledge, ProjectKnowledge
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of callee entries injected per depth level in the prompt.
+# Prevents the context window from being overwhelmed on wide call graphs.
+_MAX_CALLEES_PER_LEVEL = 10
+
+# BFS depth limit for callee traversal
+_CALLEE_BFS_DEPTH = 4
 
 
 class ProjectKnowledgeBase:
@@ -23,7 +35,7 @@ class ProjectKnowledgeBase:
 
     Provides:
     - Fast lookup by key or qualifiedName
-    - Context packets for LLM prompts (callee signatures, descriptions)
+    - Context packets for LLM prompts (hierarchy + callee graph + types)
     - Source-level comment extraction fallback for non-PKB callees
     """
 
@@ -51,8 +63,6 @@ class ProjectKnowledgeBase:
                 file=location.get("file", ""),
                 line=location.get("line", 0),
                 end_line=location.get("endLine", 0),
-                # functions.json uses "parameters"; cache serialisation uses
-                # "params".  Accept either so both sources work correctly.
                 params=data.get("parameters", data.get("params", [])),
                 calls_ids=data.get("callsIds", []),
                 called_by_ids=data.get("calledByIds", []),
@@ -124,36 +134,36 @@ class ProjectKnowledgeBase:
     def build_context_packet(self, func_entry: FunctionEntry,
                               base_path: str) -> str:
         """
-        Construct a concise, LLM-ready context paragraph for a function.
+        Construct a concise, LLM-ready context block for a function.
 
-        Priority order for function description:
-          1. project_knowledge.json comment (from source — most accurate)
-          2. functions.json description field
-          3. (omitted)
-
-        Also includes:
-        - Parameter types resolved to enum/typedef definitions
-        - Signatures + descriptions of all directly called functions
-        - Enum / macro context for any types appearing in params
+        Structure:
+          1. Project hierarchy context  (project → module → file)
+          2. Parameters + type meanings
+          3. Function purpose
+          4. 4-level callee call graph  (BFS, project-only, deduplicated)
         """
-        lines: List[str] = []
+        sections: List[str] = []
 
-        # -- Parameters --
+        # ── 1. Hierarchical context ────────────────────────────────────
+        hierarchy = self._build_hierarchy_context(func_entry)
+        if hierarchy:
+            sections.append(hierarchy)
+
+        # ── 2. Parameters ─────────────────────────────────────────────
         if func_entry.params:
             param_desc = ", ".join(
                 f"{p.get('type', '')} {p.get('name', '')}".strip()
                 for p in func_entry.params
             )
-            lines.append(f"Parameters: {param_desc}")
+            sections.append(f"Parameters: {param_desc}")
 
-            # Resolve enum/typedef meanings for parameter types
             type_context = self._resolve_param_types(func_entry.params)
             if type_context:
-                lines.append("Parameter type context:")
+                sections.append("Parameter type context:")
                 for tc in type_context:
-                    lines.append(f"  {tc}")
+                    sections.append(f"  {tc}")
 
-        # -- Function purpose: prefer scanner comment over functions.json --
+        # ── 3. Function purpose ────────────────────────────────────────
         purpose = ""
         if self._knowledge:
             fk = self._knowledge.functions.get(func_entry.qualified_name)
@@ -162,34 +172,187 @@ class ProjectKnowledgeBase:
         if not purpose and func_entry.description:
             purpose = func_entry.description
         if purpose:
-            lines.append(f"Purpose: {purpose}")
+            sections.append(f"Purpose: {purpose}")
 
-        # -- Called functions --
-        callees = self._resolve_callees(func_entry.calls_ids, base_path)
-        if callees:
-            lines.append("\nCalled functions context:")
-            for c in callees:
-                sig = c["signature"]
-                desc = c.get("description", "")
-                if desc:
-                    lines.append(f"  - {sig}  →  {desc}")
+        # ── 4. 4-level callee call graph ───────────────────────────────
+        callee_context = self._build_callee_bfs_context(func_entry, base_path)
+        if callee_context:
+            sections.append(callee_context)
+
+        return "\n".join(sections)
+
+    # ------------------------------------------------------------------
+    # Hierarchy context builder
+    # ------------------------------------------------------------------
+
+    def _build_hierarchy_context(self, func_entry: FunctionEntry) -> str:
+        """
+        Build the project → module → file hierarchy block.
+
+        Uses summaries stored in ProjectKnowledge (populated by
+        project_scanner.py --llm-summarize).  Gracefully omits any
+        level whose summary is empty.
+        """
+        if not self._knowledge:
+            return ""
+
+        lines: List[str] = []
+
+        # Project summary
+        if self._knowledge.project_summary:
+            name = self._knowledge.project_name or "Project"
+            lines.append(f"[Project] {name}: {self._knowledge.project_summary}")
+
+        # Module summary — derive module path from function's file
+        if func_entry.file and self._knowledge.module_summaries:
+            module_path = _parent_dir(func_entry.file)
+            module_summary = self._knowledge.module_summaries.get(module_path, "")
+            if not module_summary and "/" in module_path:
+                # Try parent of parent (e.g. src/qos/detail → src/qos)
+                module_summary = self._knowledge.module_summaries.get(
+                    _parent_dir(module_path), ""
+                )
+            if module_summary:
+                lines.append(f"[Module] {module_path}/: {module_summary}")
+
+        # File summary
+        if func_entry.file and self._knowledge.file_summaries:
+            file_summary = self._knowledge.file_summaries.get(func_entry.file, "")
+            if file_summary:
+                file_name = func_entry.file.split("/")[-1]
+                lines.append(f"[File] {file_name}: {file_summary}")
+
+        if not lines:
+            return ""
+
+        return "=== Project Context ===\n" + "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # 4-level BFS callee context
+    # ------------------------------------------------------------------
+
+    def _build_callee_bfs_context(self, func_entry: FunctionEntry,
+                                   base_path: str) -> str:
+        """
+        BFS traversal of the call graph up to _CALLEE_BFS_DEPTH levels.
+
+        Filters to project-only functions (must exist in project_knowledge).
+        Deduplicates via a visited set so the same function only appears once.
+
+        Returns a formatted multi-section string for prompt injection,
+        or an empty string if no project callees are found.
+        """
+        if not self._knowledge:
+            # Fall back to level-1 only from PKB
+            level1 = self._resolve_level1_from_pkb(func_entry, base_path)
+            if not level1:
+                return ""
+            lines = ["\n=== Called Functions Context ==="]
+            lines.append("Direct calls:")
+            for info in level1:
+                lines.append(_format_callee_entry(info))
+            return "\n".join(lines)
+
+        # BFS across up to 4 levels
+        visited: Set[str] = {func_entry.qualified_name}
+        by_level: Dict[int, List[Dict]] = {}
+
+        # Level 1 seed: from functions.json callsIds
+        current_qnames: List[str] = []
+        for cid in func_entry.calls_ids:
+            qname = _callsid_to_qname(cid)
+            if qname and qname not in visited:
+                fk = self._knowledge.functions.get(qname)
+                if fk:
+                    info = _make_callee_info(qname, fk)
+                    by_level.setdefault(1, []).append(info)
+                    visited.add(qname)
+                    current_qnames.append(qname)
+                    if len(by_level.get(1, [])) >= _MAX_CALLEES_PER_LEVEL:
+                        break
                 else:
-                    lines.append(f"  - {sig}")
+                    # Callee not in project_knowledge — try source fallback for level 1
+                    fallback = _extract_callee_from_source(cid, base_path)
+                    if fallback:
+                        by_level.setdefault(1, []).append(fallback)
+                        visited.add(qname)
+
+        # Levels 2–4: follow calls stored in FunctionKnowledge.calls
+        for depth in range(2, _CALLEE_BFS_DEPTH + 1):
+            next_qnames: List[str] = []
+            for qname in current_qnames:
+                fk = self._knowledge.functions.get(qname)
+                if not fk:
+                    continue
+                for callee_qname in fk.calls:
+                    if callee_qname in visited:
+                        continue
+                    callee_fk = self._knowledge.functions.get(callee_qname)
+                    if not callee_fk:
+                        continue  # not a project function — skip
+                    info = _make_callee_info(callee_qname, callee_fk)
+                    by_level.setdefault(depth, []).append(info)
+                    visited.add(callee_qname)
+                    next_qnames.append(callee_qname)
+                    if len(by_level.get(depth, [])) >= _MAX_CALLEES_PER_LEVEL:
+                        break
+
+            if not next_qnames:
+                break
+            current_qnames = next_qnames
+
+        if not by_level:
+            return ""
+
+        lines = ["\n=== Called Functions Context ==="]
+        depth_labels = {
+            1: "Direct calls",
+            2: "Calls made by direct callees (depth 2)",
+            3: "Calls at depth 3",
+            4: "Calls at depth 4",
+        }
+        for depth in sorted(by_level.keys()):
+            entries = by_level[depth]
+            lines.append(f"\n{depth_labels.get(depth, f'Depth {depth}')}:")
+            for info in entries:
+                lines.append(_format_callee_entry(info))
 
         return "\n".join(lines)
 
+    def _resolve_level1_from_pkb(self, func_entry: FunctionEntry,
+                                   base_path: str) -> List[Dict]:
+        """Level-1 callee resolution without project knowledge (PKB only)."""
+        result = []
+        for cid in func_entry.calls_ids:
+            entry = self._functions.get(cid)
+            if entry:
+                param_str = ", ".join(
+                    f"{p.get('type','')} {p.get('name','')}".strip()
+                    for p in entry.params
+                )
+                description = entry.description or ""
+                result.append({
+                    "signature": f"{entry.qualified_name}({param_str})",
+                    "description": description,
+                    "file": entry.file,
+                })
+            else:
+                fallback = _extract_callee_from_source(cid, base_path)
+                if fallback:
+                    result.append(fallback)
+        return result
+
+    # ------------------------------------------------------------------
+    # Parameter type resolution
+    # ------------------------------------------------------------------
+
     def _resolve_param_types(self, params: List[Dict]) -> List[str]:
-        """
-        For each parameter type, look up enum definitions or typedef meanings
-        from project knowledge and return human-readable descriptions.
-        """
         if not self._knowledge:
             return []
         result = []
-        seen = set()
+        seen: Set[str] = set()
         for param in params:
             raw_type = param.get("type", "")
-            # Extract simple type name (strip pointers, refs, templates)
             simple = re.sub(r"[*&<> ].*", "", raw_type.split("::")[-1]).strip()
             if not simple or simple in seen:
                 continue
@@ -206,54 +369,52 @@ class ProjectKnowledgeBase:
 
         return result
 
-    def _resolve_callees(self, calls_ids: List[str],
-                         base_path: str) -> List[Dict]:
-        """
-        Resolve callee context.  Priority:
-          1. functions.json entry (has full param list)
-          2. project_knowledge.json function comment
-          3. Source file parsing fallback
-        """
-        result = []
-        for cid in calls_ids:
-            entry = self._functions.get(cid)
-            if entry:
-                param_str = ", ".join(
-                    f"{p.get('type','')} {p.get('name','')}".strip()
-                    for p in entry.params
-                )
-                # Prefer scanner comment over functions.json description
-                description = entry.description or ""
-                if self._knowledge:
-                    fk = self._knowledge.functions.get(entry.qualified_name)
-                    if fk and fk.comment:
-                        description = fk.comment
-                result.append({
-                    "signature": f"{entry.qualified_name}({param_str})",
-                    "description": description,
-                    "file": entry.file,
-                })
-            else:
-                # Callee not in PKB — try project knowledge then source parsing
-                if self._knowledge:
-                    qname = cid.split("|")[2] if "|" in cid else cid
-                    fk = self._knowledge.functions.get(qname)
-                    if fk:
-                        result.append({
-                            "signature": fk.signature,
-                            "description": fk.comment,
-                            "file": fk.file,
-                        })
-                        continue
-                callee_context = _extract_callee_from_source(cid, base_path)
-                if callee_context:
-                    result.append(callee_context)
-        return result
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _parent_dir(file_path: str) -> str:
+    """Return the parent directory path of a relative file path."""
+    parts = file_path.replace("\\", "/").split("/")
+    if len(parts) <= 1:
+        return "."
+    return "/".join(parts[:-1])
 
 
-# ------------------------------------------------------------------
+def _callsid_to_qname(calls_id: str) -> str:
+    """
+    Extract the qualified function name from a callsId string.
+    Format: "src|file|qualified::Name|param,types"
+    """
+    if "|" in calls_id:
+        parts = calls_id.split("|")
+        if len(parts) >= 3:
+            return parts[2]
+    return calls_id
+
+
+def _make_callee_info(qname: str, fk: FunctionKnowledge) -> Dict:
+    """Build a callee info dict from a FunctionKnowledge entry."""
+    return {
+        "signature": fk.signature or qname,
+        "description": fk.comment or "",
+        "file": fk.file,
+    }
+
+
+def _format_callee_entry(info: Dict) -> str:
+    """Format one callee info dict as a single prompt line."""
+    sig = info.get("signature", "")
+    desc = info.get("description", "")
+    if desc:
+        return f"  - {sig}  →  {desc}"
+    return f"  - {sig}"
+
+
+# ---------------------------------------------------------------------------
 # Source-level callee extraction (fallback for unknown functions)
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def _extract_callee_from_source(callee_id: str, base_path: str) -> Optional[Dict]:
     """
@@ -268,7 +429,6 @@ def _extract_callee_from_source(callee_id: str, base_path: str) -> Optional[Dict
     relative_file_hint = parts[0] + "/" + parts[1]
     qualified_name = parts[2]
 
-    # Try candidate file paths
     candidate_paths = [
         Path(base_path) / f"{relative_file_hint}.cpp",
         Path(base_path) / f"{relative_file_hint}.h",
@@ -284,7 +444,6 @@ def _extract_callee_from_source(callee_id: str, base_path: str) -> Optional[Dict
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
-
             sig, comment = _find_function_in_source(content, simple_name)
             if sig:
                 return {
@@ -298,36 +457,31 @@ def _extract_callee_from_source(callee_id: str, base_path: str) -> Optional[Dict
     return None
 
 
-def _find_function_in_source(source: str, simple_name: str):
+def _find_function_in_source(source: str, simple_name: str) -> Tuple[str, str]:
     """
     Search source text for a function definition matching simple_name.
-    Returns (signature_line, preceding_comment) or (None, None).
+    Returns (signature_line, preceding_comment) or ("", "").
     """
     lines = source.splitlines()
     for i, line in enumerate(lines):
-        # Match function definition: name followed by (
         if re.search(rf'\b{re.escape(simple_name)}\s*\(', line):
-            # Extract the signature (may span multiple lines up to {)
             sig_lines = [line.strip()]
             j = i + 1
             while j < len(lines) and "{" not in "".join(sig_lines):
                 sig_lines.append(lines[j].strip())
                 j += 1
             signature = " ".join(sig_lines).split("{")[0].strip()
-
-            # Look for preceding comment (/** */ or //)
             comment = _extract_preceding_comment(lines, i)
             return signature, comment
 
-    return None, None
+    return "", ""
 
 
 def _extract_preceding_comment(lines: List[str], func_line_idx: int) -> str:
     """Extract the nearest doc comment above a function definition."""
-    comment_lines = []
+    comment_lines: List[str] = []
     i = func_line_idx - 1
 
-    # Skip blank lines
     while i >= 0 and not lines[i].strip():
         i -= 1
 
@@ -336,14 +490,12 @@ def _extract_preceding_comment(lines: List[str], func_line_idx: int) -> str:
 
     line = lines[i].strip()
 
-    # Single-line comment
     if line.startswith("//"):
         while i >= 0 and lines[i].strip().startswith("//"):
             comment_lines.insert(0, lines[i].strip().lstrip("/ "))
             i -= 1
         return " ".join(comment_lines)
 
-    # Block comment end */
     if line.endswith("*/"):
         while i >= 0 and "/*" not in lines[i]:
             raw = lines[i].strip().lstrip("* ")

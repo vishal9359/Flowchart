@@ -5,27 +5,42 @@ Scans every C++ source file in a project using libclang and extracts
 rich semantic context that flowchart_engine.py uses when prompting the LLM:
 
   - Function signatures + Doxygen / inline comments
+  - Function call graph (which project functions each function calls)
   - Enum declarations with all values and per-value comments
   - #define macro definitions with values and comments
   - typedef / using type aliases with underlying types and comments
+  - Struct / class member field declarations
+
+Optionally, with --llm-summarize, runs a 4-level LLM summarization pass:
+  1. Function level  — one-sentence summary for each undocumented function
+  2. File level      — 2-3 sentence description per source file
+  3. Module level    — 2-3 sentence description per directory module
+  4. Project level   — overall project description (README preferred)
 
 Run this ONCE per project (or whenever the project changes) to build
 project_knowledge.json, then pass it to flowchart_engine.py via
 --knowledge-json.
 
-Usage:
+Usage (scan only):
+    python project_scanner.py \\
+        --project-dir /path/to/cpp-project \\
+        --std         c++17 \\
+        --clang-arg="-I/path/to/includes" \\
+        --out         project_knowledge.json
+
+Usage (scan + LLM summarization):
     python project_scanner.py \\
         --project-dir /path/to/cpp-project \\
         --std         c++17 \\
         --clang-arg="-I/path/to/includes" \\
         --out         project_knowledge.json \\
-        [--project-name poseidonos] \\
-        [--extensions  .cpp,.h,.hpp,.cc,.cxx] \\
-        [--exclude-dirs build,third_party,external,test] \\
-        [--verbose]
+        --llm-summarize \\
+        --llm-url     http://localhost:11434/api/generate \\
+        --llm-model   gpt-oss
 """
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -79,16 +94,21 @@ _CONTAINER_KINDS = frozenset({
 #   PARSE_DETAILED_PROCESSING_RECORD  — expose MACRO_DEFINITION cursors
 #   PARSE_INCOMPLETE                  — tolerate missing headers/types
 #
-#   PARSE_SKIP_FUNCTION_BODIES is intentionally NOT included.
-#   With that flag, libclang marks out-of-line method definitions as
-#   non-definitions, so is_definition() returns False for methods defined
-#   in .cpp files — which would cause the scanner to miss them entirely.
+#   PARSE_SKIP_FUNCTION_BODIES is intentionally NOT included so that
+#   CALL_EXPR nodes inside bodies are visible for call-graph extraction.
 _PARSE_OPTIONS = (
     ci.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
     | ci.TranslationUnit.PARSE_INCOMPLETE
 )
 
 _DEFAULT_EXTENSIONS = {".cpp", ".h", ".hpp", ".cc", ".cxx", ".hh", ".h++"}
+
+# Qualified-name prefixes that are definitely not project functions
+_LIBRARY_PREFIXES: Tuple[str, ...] = (
+    "std::", "__", "boost::", "spdlog::", "fmt::",
+    "google::", "testing::", "gtest::", "absl::",
+    "llvm::", "clang::", "folly::",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +152,11 @@ def _relative(abs_path: str, base_path: str) -> str:
         return str(Path(abs_path).relative_to(base_path)).replace("\\", "/")
     except ValueError:
         return abs_path.replace("\\", "/")
+
+
+def _is_library_call(qname: str) -> bool:
+    """Return True if qname looks like a standard-library or well-known framework call."""
+    return any(qname.startswith(p) for p in _LIBRARY_PREFIXES)
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +296,49 @@ def _extent_text(lines: List[str],
 
 
 # ---------------------------------------------------------------------------
+# Call-graph extraction helper
+# ---------------------------------------------------------------------------
+
+def _collect_calls(func_cursor: ci.Cursor) -> List[str]:
+    """
+    Traverse a function cursor's body for CALL_EXPR nodes.
+
+    For each call, attempts to resolve the referenced declaration.
+    Only includes calls where:
+      - The referenced declaration is from a non-system file
+      - The qualified name does not match a known library prefix
+
+    Returns a deduplicated list of qualified callee names (project-only).
+    """
+    calls: List[str] = []
+    seen: Set[str] = set()
+
+    def _walk(cursor: ci.Cursor) -> None:
+        for child in cursor.get_children():
+            if child.kind == ci.CursorKind.CALL_EXPR:
+                qname = ""
+                try:
+                    ref = child.referenced
+                    if ref:
+                        loc = ref.location
+                        if loc.file and not _is_system_path(loc.file.name):
+                            qname = ref.spelling or ""
+                except Exception:
+                    pass
+
+                if qname and qname not in seen and not _is_library_call(qname):
+                    seen.add(qname)
+                    calls.append(qname)
+
+            # Recurse into all children (but not into nested function definitions)
+            if child.kind not in _FUNCTION_KINDS:
+                _walk(child)
+
+    _walk(func_cursor)
+    return calls
+
+
+# ---------------------------------------------------------------------------
 # Per-file knowledge extractor
 # ---------------------------------------------------------------------------
 
@@ -316,9 +384,6 @@ class FileKnowledgeExtractor:
                 knowledge: ProjectKnowledge,
                 base_path: str) -> None:
         """Parse file_path and populate knowledge."""
-        # IMPORTANT: use _norm_path (abspath, no symlink resolution) so the
-        # path we pass to index.parse() is the exact same string that
-        # libclang will put in cursor.location.file.name.
         abs_path = _norm_path(str(file_path))
         rel_path = _relative(abs_path, base_path)
 
@@ -424,8 +489,6 @@ class FileKnowledgeExtractor:
                 self._extract_typedef(child, lines, rel_path, knowledge)
 
             elif kind in _FUNCTION_KINDS:
-                # No is_definition() filter — we want both .h declarations
-                # and .cpp definitions for the knowledge base.
                 self._extract_function(child, lines, rel_path, knowledge)
 
     # ------------------------------------------------------------------
@@ -459,22 +522,31 @@ class FileKnowledgeExtractor:
         if not comment and src_line:
             comment = _inline_comment(src_line)
 
+        # Collect call graph only from definitions (bodies present)
+        calls: List[str] = []
+        if cursor.is_definition():
+            calls = _collect_calls(cursor)
+
         fk = FunctionKnowledge(
             qualified_name=qname,
             signature=sig,
             file=rel_path,
             line=cursor.location.line,
             comment=comment,
+            calls=calls,
         )
 
         existing = knowledge.functions.get(qname)
         if existing is None:
             knowledge.functions[qname] = fk
         elif not existing.comment and comment:
-            # Upgrade to version that has a doc comment
+            # Upgrade to version that has a doc comment; preserve calls if richer
+            fk.calls = fk.calls if fk.calls else existing.calls
             knowledge.functions[qname] = fk
-        elif not existing.comment and cursor.is_definition():
-            # Upgrade to the actual definition (has full signature)
+        elif cursor.is_definition() and not existing.calls and calls:
+            # Upgrade to add call-graph info from the definition
+            existing.calls = calls
+        elif cursor.is_definition() and not existing.comment:
             knowledge.functions[qname] = fk
 
     # ------------------------------------------------------------------
@@ -544,15 +616,11 @@ class FileKnowledgeExtractor:
             return
 
         # For function-like macros  e.g. #define TRACE_DEBUG(id, ...)  body...
-        # Extract the expansion body (everything after the closing ')' of the
-        # parameter list) so the LLM receives the actual macro behaviour rather
-        # than a raw parameter signature.
         if value.startswith("("):
             value = _funclike_macro_body(value)
             if not value:
-                return   # empty expansion (e.g. guard macros disabled by #ifdef)
+                return
 
-        # Skip macros with no value after normalisation
         if not value:
             return
 
@@ -608,17 +676,6 @@ class FileKnowledgeExtractor:
     def _extract_struct(self, cursor: ci.Cursor, lines: List[str],
                          rel_path: str,
                          knowledge: ProjectKnowledge) -> None:
-        """
-        Extract field member declarations from a CLASS_DECL or STRUCT_DECL.
-
-        For each FIELD_DECL child, records:
-          - field name
-          - declared type spelling
-          - inline or preceding comment
-
-        The result is stored under both the qualified name and the simple
-        (unqualified) name so the enricher can look up members by either.
-        """
         qname = cursor.type.spelling or cursor.spelling
         if not qname or qname.startswith("("):
             return
@@ -658,10 +715,311 @@ class FileKnowledgeExtractor:
             members=members,
         )
         knowledge.structs[qname] = sk
-        # Also index by simple (unqualified) name for easy lookup
         simple = qname.split("::")[-1].split("<")[0].strip()
         if simple and simple != qname:
             knowledge.structs[simple] = sk
+
+
+# ---------------------------------------------------------------------------
+# Hierarchy LLM Summarizer
+# ---------------------------------------------------------------------------
+
+class HierarchySummarizer:
+    """
+    4-level LLM summarization pass.
+
+    After project_scanner.py has completed its structural scan, this class
+    runs LLM calls to fill in semantic understanding at every level:
+      1. Function  — one-sentence summary for undocumented functions
+      2. File      — 2-3 sentence description per source file
+      3. Module    — 2-3 sentence description per directory
+      4. Project   — overall description (README preferred, else from modules)
+
+    All results are stored back into the ProjectKnowledge object and
+    persisted to the output JSON by the caller.
+
+    LLM calls are batched to minimise round-trips:
+      - Functions : up to batch_size functions per call
+      - Files     : 1 call per file
+      - Modules   : 1 call per module directory
+      - Project   : 1 call total
+    """
+
+    _FUNC_SYSTEM = (
+        "You are a C++ code analyst. "
+        "For each function below, write ONE concise sentence (max 20 words) "
+        "describing what it does. "
+        "Return ONLY a JSON object: {\"FunctionName\": \"sentence.\", ...}. "
+        "No markdown, no code fences, no extra text."
+    )
+    _FILE_SYSTEM = (
+        "You are a C++ software architect. "
+        "Summarize the responsibility of the given source file in 2-3 sentences. "
+        "Output only the sentences, no headings or lists."
+    )
+    _MODULE_SYSTEM = (
+        "You are a C++ software architect. "
+        "Summarize the purpose of the given software module (directory) in 2-3 sentences. "
+        "Output only the sentences, no headings or lists."
+    )
+    _PROJECT_SYSTEM = (
+        "You are a software architect. "
+        "Summarize the overall purpose of the given software project in 2-3 sentences. "
+        "Output only the sentences, no headings or lists."
+    )
+
+    def __init__(self, knowledge: ProjectKnowledge,
+                 llm_client,          # LlmClient instance
+                 project_dir: str,
+                 batch_size: int = 8,
+                 verbose: bool = False) -> None:
+        self._k = knowledge
+        self._client = llm_client
+        self._project_dir = project_dir
+        self._batch_size = batch_size
+        self._verbose = verbose
+
+    # ------------------------------------------------------------------
+    # Public entry
+    # ------------------------------------------------------------------
+
+    def summarize(self) -> None:
+        """Run all four summarization levels in order."""
+        logger.info("── Hierarchy summarization starting ──")
+        self._summarize_functions()
+        self._summarize_files()
+        self._summarize_modules()
+        self._summarize_project()
+        logger.info("── Hierarchy summarization complete ──")
+
+    # ------------------------------------------------------------------
+    # Level 1 — Function summaries
+    # ------------------------------------------------------------------
+
+    def _summarize_functions(self) -> None:
+        # Collect unique unsummarized functions (dedup by qualified_name)
+        seen_qnames: Set[str] = set()
+        unique: List[FunctionKnowledge] = []
+        for fk in self._k.functions.values():
+            if not fk.comment and fk.qualified_name not in seen_qnames:
+                seen_qnames.add(fk.qualified_name)
+                unique.append(fk)
+
+        if not unique:
+            logger.info("  All functions already have comments — skipping function summarization")
+            return
+
+        logger.info("  Summarizing %d undocumented functions (batch=%d)...",
+                    len(unique), self._batch_size)
+
+        done = 0
+        for i in range(0, len(unique), self._batch_size):
+            batch = unique[i: i + self._batch_size]
+            summaries = self._summarize_function_batch(batch)
+            for fk in batch:
+                key = fk.qualified_name.split("::")[-1]  # short name for JSON key
+                summary = summaries.get(key) or summaries.get(fk.qualified_name, "")
+                if summary:
+                    # Update ALL entries with this qualified name
+                    for stored in self._k.functions.values():
+                        if stored.qualified_name == fk.qualified_name and not stored.comment:
+                            stored.comment = summary.strip().rstrip(".")+ "."
+            done += len(batch)
+            if done % 50 == 0 or done == len(unique):
+                logger.info("  Function summaries: %d/%d", done, len(unique))
+
+    def _summarize_function_batch(self,
+                                   batch: List[FunctionKnowledge]) -> Dict[str, str]:
+        """Single LLM call for up to batch_size functions. Returns {shortName: summary}."""
+        parts = []
+        for fk in batch:
+            body_lines = self._read_body(fk, max_lines=12)
+            short_name = fk.qualified_name.split("::")[-1]
+            block = f"Function [{short_name}]:\n  Signature: {fk.signature}\n  File: {fk.file}"
+            if body_lines:
+                block += "\n  Body (first lines):\n"
+                block += "\n".join(f"    {l}" for l in body_lines)
+            parts.append(block)
+
+        user_prompt = "\n\n".join(parts)
+        user_prompt += (
+            "\n\nReturn a JSON object where each key is the function name in "
+            "brackets above (the part inside [...]) and the value is a ONE-sentence summary."
+        )
+
+        raw = self._client.generate(self._FUNC_SYSTEM, user_prompt)
+        if not raw:
+            return {}
+        return self._parse_json_dict(raw)
+
+    # ------------------------------------------------------------------
+    # Level 2 — File summaries
+    # ------------------------------------------------------------------
+
+    def _summarize_files(self) -> None:
+        # Group unique functions by file
+        by_file: Dict[str, List[FunctionKnowledge]] = {}
+        seen_qnames: Set[str] = set()
+        for fk in self._k.functions.values():
+            if fk.file and fk.qualified_name not in seen_qnames:
+                seen_qnames.add(fk.qualified_name)
+                by_file.setdefault(fk.file, []).append(fk)
+
+        logger.info("  Summarizing %d files...", len(by_file))
+        for file_path, funcs in sorted(by_file.items()):
+            try:
+                summary = self._summarize_one_file(file_path, funcs)
+                if summary:
+                    self._k.file_summaries[file_path] = summary
+            except Exception as exc:
+                logger.debug("  File summary failed for %s: %s", file_path, exc)
+
+    def _summarize_one_file(self, file_path: str,
+                             funcs: List[FunctionKnowledge]) -> str:
+        func_lines = []
+        for fk in funcs[:30]:
+            line = f"  - {fk.signature}"
+            if fk.comment:
+                line += f": {fk.comment}"
+            func_lines.append(line)
+
+        prompt = (
+            f"File: {file_path}\n"
+            f"Functions ({len(funcs)} total, showing up to 30):\n"
+            + "\n".join(func_lines)
+            + "\n\nSummarize the responsibility of this file in 2-3 sentences."
+        )
+        raw = self._client.generate(self._FILE_SYSTEM, prompt)
+        return raw.strip()[:600] if raw else ""
+
+    # ------------------------------------------------------------------
+    # Level 3 — Module summaries
+    # ------------------------------------------------------------------
+
+    def _summarize_modules(self) -> None:
+        # Group files by their immediate parent directory (the module)
+        by_module: Dict[str, List[str]] = {}
+        for file_path in self._k.file_summaries:
+            parts = file_path.replace("\\", "/").split("/")
+            module = "/".join(parts[:-1]) if len(parts) > 1 else "."
+            by_module.setdefault(module, []).append(file_path)
+
+        logger.info("  Summarizing %d modules...", len(by_module))
+        for module_path, files in sorted(by_module.items()):
+            try:
+                summary = self._summarize_one_module(module_path, files)
+                if summary:
+                    self._k.module_summaries[module_path] = summary
+            except Exception as exc:
+                logger.debug("  Module summary failed for %s: %s", module_path, exc)
+
+    def _summarize_one_module(self, module_path: str,
+                               file_paths: List[str]) -> str:
+        file_lines = []
+        for fp in file_paths[:20]:
+            fs = self._k.file_summaries.get(fp, "")
+            line = f"  - {fp}"
+            if fs:
+                # Use only first sentence to keep prompt compact
+                first_sentence = fs.split(".")[0].strip()
+                line += f": {first_sentence}"
+            file_lines.append(line)
+
+        prompt = (
+            f"Module directory: {module_path}\n"
+            f"Files ({len(file_paths)} total, showing up to 20):\n"
+            + "\n".join(file_lines)
+            + "\n\nSummarize the purpose of this module in 2-3 sentences."
+        )
+        raw = self._client.generate(self._MODULE_SYSTEM, prompt)
+        return raw.strip()[:600] if raw else ""
+
+    # ------------------------------------------------------------------
+    # Level 4 — Project summary
+    # ------------------------------------------------------------------
+
+    def _summarize_project(self) -> None:
+        logger.info("  Summarizing project...")
+
+        # Prefer README.md if it exists
+        for readme_name in ("README.md", "readme.md", "README.txt", "README"):
+            readme_path = Path(self._project_dir) / readme_name
+            if readme_path.exists():
+                try:
+                    readme_text = readme_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )[:3000]
+                    prompt = (
+                        f"Project: {self._k.project_name}\n"
+                        f"README:\n{readme_text}\n\n"
+                        "Summarize what this project does in 2-3 sentences."
+                    )
+                    raw = self._client.generate(self._PROJECT_SYSTEM, prompt)
+                    if raw and raw.strip():
+                        self._k.project_summary = raw.strip()[:600]
+                        logger.info("  Project summary generated from README")
+                        return
+                except Exception as exc:
+                    logger.debug("  README read failed: %s", exc)
+
+        # Fall back: aggregate top module summaries
+        if not self._k.module_summaries:
+            logger.info("  No module summaries available — skipping project summary")
+            return
+
+        module_lines = [
+            f"  - {mod}: {summary[:100]}"
+            for mod, summary in list(self._k.module_summaries.items())[:20]
+        ]
+        prompt = (
+            f"Project: {self._k.project_name}\n"
+            f"Modules ({len(self._k.module_summaries)} total, showing up to 20):\n"
+            + "\n".join(module_lines)
+            + "\n\nSummarize the overall purpose of this project in 2-3 sentences."
+        )
+        raw = self._client.generate(self._PROJECT_SYSTEM, prompt)
+        if raw and raw.strip():
+            self._k.project_summary = raw.strip()[:600]
+            logger.info("  Project summary generated from module descriptions")
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _read_body(self, fk: FunctionKnowledge, max_lines: int = 12) -> List[str]:
+        """Read the first max_lines of a function body from source."""
+        try:
+            file_path = Path(self._project_dir) / fk.file
+            if not file_path.exists():
+                return []
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+            start_idx = max(0, fk.line - 1)
+            end_idx = min(len(all_lines), start_idx + max_lines + 3)
+            return [l.rstrip() for l in all_lines[start_idx:end_idx]]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _parse_json_dict(raw: str) -> Dict[str, str]:
+        """Extract a JSON object from an LLM response."""
+        raw = re.sub(r"```(?:json)?\s*", "", raw)
+        raw = re.sub(r"```", "", raw)
+        start = raw.find("{")
+        if start == -1:
+            return {}
+        depth = 0
+        for i in range(start, len(raw)):
+            if raw[i] == "{":
+                depth += 1
+            elif raw[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(raw[start: i + 1])
+                    except Exception:
+                        return {}
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +1088,22 @@ def _parse_args() -> argparse.Namespace:
                    help="Comma-separated directory names to skip")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Enable debug logging (shows per-file extraction counts)")
+
+    # LLM summarization arguments
+    p.add_argument("--llm-summarize", action="store_true",
+                   help="Run 4-level LLM summarization after scanning "
+                        "(function → file → module → project)")
+    p.add_argument("--llm-url", default="http://localhost:11434/api/generate",
+                   help="LLM endpoint URL for summarization (default: Ollama local)")
+    p.add_argument("--llm-model", default="gpt-oss",
+                   help="LLM model name for summarization (default: gpt-oss)")
+    p.add_argument("--llm-timeout", type=int, default=120,
+                   help="LLM request timeout in seconds (default: 120)")
+    p.add_argument("--summarize-batch-size", type=int, default=8,
+                   help="Number of functions per LLM summarization call (default: 8)")
+    p.add_argument("--use-openai-format", action="store_true",
+                   help="Use OpenAI-compatible chat/completions API format")
+
     return p.parse_args()
 
 
@@ -753,6 +1127,8 @@ if __name__ == "__main__":
     logger.info("  extensions   : %s", extensions)
     logger.info("  exclude-dirs : %s", exclude_dirs)
     logger.info("  output       : %s", args.out)
+    if args.llm_summarize:
+        logger.info("  llm-summarize: ON  model=%s  url=%s", args.llm_model, args.llm_url)
     logger.info("=" * 60)
 
     knowledge = scan_project(
@@ -764,6 +1140,30 @@ if __name__ == "__main__":
         project_name=args.project_name,
         verbose=args.verbose,
     )
+
+    # Optional LLM summarization pass
+    if args.llm_summarize:
+        try:
+            from llm.client import LlmClient  # import here to keep scanner standalone
+            llm_client = LlmClient(
+                url=args.llm_url,
+                model=args.llm_model,
+                timeout=args.llm_timeout,
+                temperature=0.1,
+                use_openai_format=args.use_openai_format,
+            )
+            summarizer = HierarchySummarizer(
+                knowledge=knowledge,
+                llm_client=llm_client,
+                project_dir=args.project_dir,
+                batch_size=args.summarize_batch_size,
+                verbose=args.verbose,
+            )
+            summarizer.summarize()
+        except ImportError:
+            logger.error("Cannot import LlmClient — ensure llm/client.py is accessible")
+        except Exception as exc:
+            logger.error("LLM summarization failed: %s", exc, exc_info=args.verbose)
 
     save_knowledge(knowledge, args.out)
 

@@ -35,9 +35,9 @@ class EngineConfig:
     llm_timeout: int = 120
     llm_max_retries: int = 2
     llm_temperature: float = 0.1
-    # Nodes per LLM call.  Reduce for small-context-window models (e.g. 4k).
-    # Each batch sends only the source lines of its nodes, not the full source.
-    llm_batch_size: int = 8
+    # Nodes per LLM call.  4 is safe for 2048-token models.
+    # The generator auto-halves down to 1 node if the LLM returns no response.
+    llm_batch_size: int = 4
     # Ollama num_ctx: explicitly sets the model's context window for each call.
     # Ollama defaults to 2048 for many models; prompts >2048 tokens return empty.
     # Set to 8192 to safely handle all prompt sizes up to ~2500 tokens.

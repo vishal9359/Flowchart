@@ -92,9 +92,21 @@ class LlmClient:
 
         response_text = data.get("response", "").strip()
         if not response_text:
-            # Log the full server response at DEBUG level to aid diagnosis
-            logger.debug("Ollama returned empty response. Server data: %s",
-                         str(data)[:300])
+            # Promote to WARNING — this is always a meaningful signal.
+            # Common causes:
+            #   1. Prompt exceeds num_ctx → pass --llm-num-ctx 16384
+            #   2. Model returned an error body (check "error" key below)
+            #   3. Model is overloaded / timed out internally
+            error_msg = data.get("error", "")
+            if error_msg:
+                logger.warning("Ollama error: %s", error_msg)
+            else:
+                logger.warning(
+                    "Ollama returned empty response "
+                    "(prompt may exceed model's context window). "
+                    "Server data: %s",
+                    str(data)[:400],
+                )
         return response_text or None
 
     # ------------------------------------------------------------------

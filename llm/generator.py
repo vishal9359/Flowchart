@@ -3,31 +3,40 @@ LLM-based flowchart label generator.
 
 Batching strategy
 -----------------
-Large functions (many CFG nodes) produce prompts that exceed local LLM context
-windows (~4 k–8 k tokens).  The old approach sent the FULL function source code
-in every batch call.  For a 72-line function this is ~3200 chars — repeated for
-every batch of 8 nodes — consuming most of the available context budget before
-even the nodes are included.
+Large functions produce prompts that exceed local LLM context windows.  Two
+complementary strategies keep every prompt within any model's context window:
 
-Fix: each batch receives only the source lines that cover its own nodes (plus
-±SOURCE_PADDING lines for context), not the full function source.  The context
-packet (hierarchy + callee graph + function purpose) is kept in full, but is
-capped at CONTEXT_BUDGET chars if the total prompt still exceeds MAX_PROMPT_CHARS.
+  1. Smaller defaults — BATCH_SIZE=4, MAX_PROMPT_CHARS=6000 (~1500 tokens).
+     At ~3 chars/token for C++ code this fits a 2048-token default window
+     with room for JSON output.
+
+  2. Auto-halving — if ALL retries for a batch return "no LLM response"
+     (empty string from server, the Ollama signal that num_ctx was exceeded),
+     the batch is automatically split in half and each sub-batch is retried.
+     This recurses up to depth 3 (minimum 1 node per call), so the generator
+     adapts to any model's actual context window without manual tuning.
+
+Retry discipline
+----------------
+There are TWO distinct failure modes; they need different retry strategies:
+
+  * "no LLM response" (raw=None) — the server returned an empty string.
+    Root cause: prompt exceeded num_ctx.  Retrying with the SAME or LARGER
+    prompt never helps.  Retry with the SAME prompt (server may be temporarily
+    busy) but do NOT append a retry note (which makes the prompt larger).
+    After all retries fail this way, trigger auto-halving.
+
+  * "bad response" (raw is not None but JSON is wrong / nodes missing) —
+    the LLM returned something but it was malformed or incomplete.  Append a
+    targeted retry note listing the exact failing node_ids and reasons so the
+    LLM corrects precisely.
 
 Budget logic
 ------------
-MAX_PROMPT_CHARS    — total system + user prompt character limit.
-                      Conservative for 4 k-token local models.
-                      (chars ÷ 4 ≈ tokens;  6000 chars ≈ 1500 tokens → fits
-                       in 4096-token window with room for the JSON output.)
-CONTEXT_BUDGET      — max chars for the context packet; trimmed if over budget.
-SOURCE_PADDING      — lines above/below batch nodes included in excerpt.
-BATCH_SIZE          — default nodes per LLM call.
-
-Targeted retry
---------------
-On validation failure the retry prompt lists the exact failing node_ids and
-the reason so the LLM corrects precisely rather than regenerating everything.
+MAX_PROMPT_CHARS  — hard cap on system+user prompt characters.
+CONTEXT_BUDGET    — max chars for the PKB context packet.
+SOURCE_PADDING    — source lines above/below batch nodes in excerpt.
+BATCH_SIZE        — default nodes per LLM call.
 """
 
 import json
@@ -44,47 +53,36 @@ logger = logging.getLogger(__name__)
 
 # ── Prompt-size budget constants ─────────────────────────────────────────────
 
-# Maximum total characters (system + user prompt) sent to the LLM.
-# The system prompt alone is ~3400 chars.  8 nodes × 400 chars = 3200 chars.
-# Source excerpt + context adds ~3000 chars.  Total ≈ 9600 chars ≈ 2400 tokens.
-# Modern local models (llama3, etc.) support 8k–32k token windows.
-# Even the smallest common window (4096 tokens) has room for 2400-token prompts
-# with ~1700 tokens left for JSON output.
-#
-# Set to 10000 chars (≈ 2500 tokens).  This is the realistic working budget.
-# Context and source excerpt are still trimmed proportionally above this limit
-# so the generator handles even edge cases gracefully.
-MAX_PROMPT_CHARS = 10000
+# Target: fits in a 2048-token model with room for ~400 tokens of JSON output.
+# System prompt ~850 tokens + user prompt ~1150 tokens = ~2000 tokens total.
+# At 4 chars/token: 2000 tokens * 4 = 8000 chars.  Use 6000 to be safe for
+# code-heavy content which tokenizes less efficiently (~2-3 chars/token).
+MAX_PROMPT_CHARS = 6000
 
-# Maximum chars reserved for the context packet (hierarchy + callee graph).
-# The 4-level BFS can produce hundreds of entries; cap at 2500 chars so it
-# doesn't dominate the context window.
-CONTEXT_BUDGET = 2500
+# Max chars for the PKB context packet (hierarchy + callee graph).
+# The 4-level BFS can be very large; cap it so it doesn't dominate.
+CONTEXT_BUDGET = 1200
 
-# Lines of source code to include above and below the batch's node range.
-SOURCE_PADDING = 8
+# Lines of source above/below the batch node range for the excerpt.
+SOURCE_PADDING = 5
 
-# ── Batch size ────────────────────────────────────────────────────────────────
+# Default nodes per LLM call.  4 is a safe default for 2048-token models.
+# Increase via --llm-batch-size for models with larger context windows.
+BATCH_SIZE = 4
 
-# Default nodes per LLM call.  Can be overridden via --llm-batch-size.
-# Smaller values reduce prompt size; larger values reduce LLM call count.
-BATCH_SIZE = 8
-
-# Maximum characters per label (validation threshold)
+# Max label length accepted from LLM
 _MAX_LABEL_LEN = 300
+
+# Max depth for auto-halving recursion (prevents infinite split)
+_MAX_SPLIT_DEPTH = 3
 
 
 class LabelGenerator:
     """
-    Generates LLM labels for all nodes in a CFG.
+    Generates LLM labels for all CFG nodes.
 
-    Batches nodes (BATCH_SIZE per call).  Each batch sends:
-      - Full context packet (hierarchy + callee graph) — capped at CONTEXT_BUDGET
-      - Source excerpt covering only this batch's node lines (±SOURCE_PADDING)
-      - This batch's nodes only
-
-    Targeted retry per batch: lists exactly which node_ids failed and why.
-    Falls back to rule-based labels only for nodes that exhaust all retries.
+    Batches nodes BATCH_SIZE per call.  On persistent "no LLM response"
+    failures, auto-halves the batch until a working size is found.
     """
 
     def __init__(self, client: LlmClient, pkb: ProjectKnowledgeBase,
@@ -103,34 +101,28 @@ class LabelGenerator:
                   func_entry: FunctionEntry,
                   source_code: str,
                   base_path: str) -> None:
-        """
-        Fill cfg.nodes[*].label for every non-sentinel node.
-        Modifies nodes in-place.
-        """
+        """Fill cfg.nodes[*].label for every non-sentinel node. In-place."""
         labelable = [n for n in cfg.nodes.values()
                      if n.node_type not in (NodeType.START, NodeType.END)]
         if not labelable:
             return
 
-        # Build project context packet once — shared across all batch calls
         context_packet = self._pkb.build_context_packet(func_entry, base_path)
 
-        # Split into batches and label each independently
         batches = _make_batches(labelable, self._batch_size)
         label_map: Dict[str, str] = {}
 
         for batch_idx, batch in enumerate(batches):
-            batch_labels = self._label_batch(
+            batch_labels = self._label_batch_with_split(
                 batch=batch,
                 func_entry=func_entry,
                 context_packet=context_packet,
                 source_code=source_code,
             )
             label_map.update(batch_labels)
-            logger.debug(
-                "Batch %d/%d done (%d nodes) for '%s'",
-                batch_idx + 1, len(batches), len(batch), func_entry.qualified_name,
-            )
+            logger.debug("Batch %d/%d done (%d nodes) for '%s'",
+                         batch_idx + 1, len(batches), len(batch),
+                         func_entry.qualified_name)
 
         self._apply_labels(cfg, label_map)
 
@@ -141,21 +133,60 @@ class LabelGenerator:
             elif node.node_type == NodeType.END:
                 node.label = "End"
 
-        # Log fallback usage
+        # Report fallback usage
         fallback_count = sum(1 for n in labelable if _looks_like_fallback(n))
         if fallback_count > 0:
-            logger.warning(
-                "'%s': %d/%d node(s) used fallback labels",
-                func_entry.qualified_name, fallback_count, len(labelable),
-            )
+            logger.warning("'%s': %d/%d node(s) used fallback labels",
+                           func_entry.qualified_name, fallback_count, len(labelable))
         else:
-            logger.debug(
-                "'%s': all %d nodes labeled by LLM",
-                func_entry.qualified_name, len(labelable),
-            )
+            logger.debug("'%s': all %d nodes labeled by LLM",
+                         func_entry.qualified_name, len(labelable))
 
     # ------------------------------------------------------------------
-    # Per-batch labeling with targeted retry
+    # Auto-halving wrapper
+    # ------------------------------------------------------------------
+
+    def _label_batch_with_split(
+        self,
+        batch: List[CfgNode],
+        func_entry: FunctionEntry,
+        context_packet: str,
+        source_code: str,
+        depth: int = 0,
+    ) -> Dict[str, str]:
+        """
+        Label a batch.  If ALL retries returned no LLM response and the batch
+        has >1 node, split in half and retry each sub-batch independently.
+        Recurses up to _MAX_SPLIT_DEPTH times (minimum 1 node per call).
+        """
+        result, all_no_response = self._label_batch(
+            batch=batch,
+            func_entry=func_entry,
+            context_packet=context_packet,
+            source_code=source_code,
+        )
+
+        if all_no_response and len(batch) > 1 and depth < _MAX_SPLIT_DEPTH:
+            logger.warning(
+                "All %d attempt(s) returned no LLM response for a %d-node batch. "
+                "Auto-splitting in half (depth %d of %d)…",
+                self._max_retries + 1, len(batch), depth + 1, _MAX_SPLIT_DEPTH,
+            )
+            mid = len(batch) // 2
+            combined: Dict[str, str] = {}
+            for sub_batch in [batch[:mid], batch[mid:]]:
+                sub_result = self._label_batch_with_split(
+                    sub_batch, func_entry, context_packet, source_code,
+                    depth=depth + 1,
+                )
+                combined.update(sub_result)
+            # combined overrides fallback labels set by the failed full batch
+            return combined
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Core per-batch labeling
     # ------------------------------------------------------------------
 
     def _label_batch(
@@ -164,12 +195,16 @@ class LabelGenerator:
         func_entry: FunctionEntry,
         context_packet: str,
         source_code: str,
-    ) -> Dict[str, str]:
+    ) -> Tuple[Dict[str, str], bool]:
         """
-        Label a single batch of nodes.  Returns node_id → label map.
-        Falls back to rule-based labels only for nodes that keep failing.
+        Label one batch of nodes.
+
+        Returns (label_map, all_no_response) where:
+          all_no_response=True  → every attempt returned None (server issue /
+                                  context overflow) — caller should auto-halve.
+          all_no_response=False → at least one attempt got a response (even if
+                                  partial) — fallback labels are already set.
         """
-        # ── Build size-aware prompt ───────────────────────────────────
         base_prompt = _build_size_aware_prompt(
             batch=batch,
             func_entry=func_entry,
@@ -177,34 +212,47 @@ class LabelGenerator:
             source_code=source_code,
         )
 
-        # Log estimated token count at DEBUG level
         total_chars = len(SYSTEM_PROMPT) + len(base_prompt)
-        logger.debug(
-            "Batch prompt size: %d chars (~%d tokens) for %d nodes",
-            total_chars, total_chars // 4, len(batch),
-        )
+        logger.debug("Batch prompt: %d chars (~%d tokens) for %d nodes",
+                     total_chars, total_chars // 4, len(batch))
 
         required_ids = {n.node_id for n in batch}
         accumulated: Dict[str, str] = {}
         remaining: Set[str] = set(required_ids)
         last_failures: Dict[str, str] = {}
+        no_response_attempts = 0
 
         for attempt in range(1, self._max_retries + 2):
-            prompt = base_prompt if attempt == 1 else base_prompt + _build_retry_note(last_failures)
+            # ── Choose prompt for this attempt ────────────────────────
+            if attempt == 1 or no_response_attempts > 0:
+                # First attempt, or previous attempt(s) had no response.
+                # Do NOT append retry note — it only makes the prompt larger,
+                # which is exactly wrong when the server is returning empty
+                # because the prompt already exceeds num_ctx.
+                prompt = base_prompt
+            else:
+                # Previous attempt returned a response but it was incomplete.
+                # Add a targeted retry note so the LLM fixes specific nodes.
+                prompt = base_prompt + _build_retry_note(last_failures)
 
+            # ── Call LLM ──────────────────────────────────────────────
             raw = self._client.generate(SYSTEM_PROMPT, prompt)
+
             if raw is None:
+                no_response_attempts += 1
                 prompt_chars = len(SYSTEM_PROMPT) + len(prompt)
                 logger.warning(
                     "Batch attempt %d/%d: no LLM response "
                     "(prompt=%d chars ~%d tokens). "
-                    "If this keeps failing, try: --llm-batch-size 4 --llm-timeout 180",
+                    "Will auto-split if all attempts fail. "
+                    "Or pass: --llm-batch-size 2 --llm-num-ctx 16384",
                     attempt, self._max_retries + 1,
                     prompt_chars, prompt_chars // 4,
                 )
                 last_failures = {nid: "LLM returned no response" for nid in remaining}
                 continue
 
+            # ── Parse response ────────────────────────────────────────
             partial, failures = _parse_partial(raw, remaining)
             accumulated.update(partial)
             remaining -= set(partial.keys())
@@ -212,7 +260,7 @@ class LabelGenerator:
 
             if not remaining:
                 logger.debug("Batch fully labeled on attempt %d", attempt)
-                return accumulated
+                return accumulated, False
 
             logger.warning(
                 "Batch attempt %d/%d: %d node(s) still need labels — %s",
@@ -220,19 +268,23 @@ class LabelGenerator:
                 {nid: failures.get(nid, "missing") for nid in remaining},
             )
 
-        # All retries exhausted — fallback for remaining nodes only
+        # ── All retries exhausted ─────────────────────────────────────
+        all_no_response = (no_response_attempts == self._max_retries + 1)
+
         if remaining:
             node_by_id = {n.node_id: n for n in batch}
             for nid in remaining:
                 node = node_by_id.get(nid)
                 if node:
                     accumulated[nid] = _fallback_label(node)
-            logger.warning(
-                "Fallback labels applied for %d node(s): %s",
-                len(remaining), sorted(remaining),
-            )
+            if not all_no_response:
+                # Only warn about fallback here; auto-halving path warns separately
+                logger.warning(
+                    "Fallback labels applied for %d node(s): %s",
+                    len(remaining), sorted(remaining),
+                )
 
-        return accumulated
+        return accumulated, all_no_response
 
     # ------------------------------------------------------------------
     # Apply labels back to CFG nodes
@@ -259,66 +311,66 @@ def _build_size_aware_prompt(
     """
     Build a prompt that fits within MAX_PROMPT_CHARS.
 
-    Reduction strategy applied in order:
-      1. Source excerpt — send only the lines covering this batch's nodes
-         (±SOURCE_PADDING lines) instead of the full function source.
-         This reduces source contribution from ~3000 chars to ~500–1500 chars.
-      2. Context cap — trim the context packet to CONTEXT_BUDGET chars if the
-         combined prompt still exceeds MAX_PROMPT_CHARS.
-      3. Hard minimum — always send at least 400 chars of context (first few
-         lines contain the most important hierarchy info).
-
-    The node list raw_code is capped at 200 chars per node throughout.
+    Strategy (applied in order until the prompt fits):
+      1. Try WITHOUT source excerpt (nodes have raw_code; excerpt is a bonus).
+         If this already fits, optionally add a compact source excerpt.
+      2. If still too large, trim the context packet to CONTEXT_BUDGET.
+      3. Log a warning if the prompt is still large after trimming (the
+         auto-halving mechanism will handle it upstream).
     """
-    # Step 1 — build with source excerpt instead of full source
-    source_excerpt = _extract_batch_source(source_code, batch, func_entry.line)
-
-    prompt = build_user_prompt(
+    # ── Attempt 1: no source excerpt ─────────────────────────────────
+    prompt_no_src = build_user_prompt(
         qualified_name=func_entry.qualified_name,
         params=func_entry.params,
         description=func_entry.description,
         context_packet=context_packet,
-        source_code=source_excerpt,
+        source_code="",          # omit by default
         nodes=batch,
     )
 
-    total = len(SYSTEM_PROMPT) + len(prompt)
-    if total <= MAX_PROMPT_CHARS:
-        return prompt
+    total_no_src = len(SYSTEM_PROMPT) + len(prompt_no_src)
 
-    # Step 2 — trim context packet
-    # Calculate how many chars the user prompt occupies WITHOUT context,
-    # then figure out how much room is left for context.
-    user_without_context = len(prompt) - len(context_packet)
-    available_for_context = max(
-        400,  # hard minimum — always include at least the hierarchy lines
+    if total_no_src <= MAX_PROMPT_CHARS:
+        # We have headroom — try to squeeze in a compact source excerpt
+        excerpt = _extract_batch_source(source_code, batch, func_entry.line)
+        prompt_with_src = build_user_prompt(
+            qualified_name=func_entry.qualified_name,
+            params=func_entry.params,
+            description=func_entry.description,
+            context_packet=context_packet,
+            source_code=excerpt,
+            nodes=batch,
+        )
+        if len(SYSTEM_PROMPT) + len(prompt_with_src) <= MAX_PROMPT_CHARS:
+            return prompt_with_src   # full prompt with excerpt fits
+        return prompt_no_src         # excerpt didn't fit; use version without
+
+    # ── Attempt 2: trim context packet ───────────────────────────────
+    user_without_context = len(prompt_no_src) - len(context_packet)
+    available = max(
+        300,   # always keep at least the first few hierarchy lines
         MAX_PROMPT_CHARS - len(SYSTEM_PROMPT) - user_without_context,
     )
-    trimmed_context = _trim_context(
-        context_packet,
-        min(available_for_context, CONTEXT_BUDGET),
-    )
+    trimmed_context = _trim_context(context_packet, min(available, CONTEXT_BUDGET))
 
-    prompt = build_user_prompt(
+    prompt_trimmed = build_user_prompt(
         qualified_name=func_entry.qualified_name,
         params=func_entry.params,
         description=func_entry.description,
         context_packet=trimmed_context,
-        source_code=source_excerpt,
+        source_code="",
         nodes=batch,
     )
 
-    final_total = len(SYSTEM_PROMPT) + len(prompt)
+    final_total = len(SYSTEM_PROMPT) + len(prompt_trimmed)
     if final_total > MAX_PROMPT_CHARS:
-        # Prompt is still large but within reason for models with 8k+ windows.
-        # Log so the user knows they can tune --llm-batch-size if needed.
         logger.debug(
-            "Prompt is %d chars (~%d tokens) after trimming. "
-            "If LLM times out, try --llm-batch-size 4 to reduce further.",
+            "Prompt is %d chars (~%d tokens) after trimming — "
+            "auto-halving will handle it if LLM returns no response.",
             final_total, final_total // 4,
         )
 
-    return prompt
+    return prompt_trimmed
 
 
 def _extract_batch_source(
@@ -328,34 +380,23 @@ def _extract_batch_source(
     padding: int = SOURCE_PADDING,
 ) -> str:
     """
-    Return only the source lines that cover this batch's nodes ±padding lines.
-
-    Line numbers in CfgNode are absolute (matching the source file).
-    full_source starts at func_start_line.
-
-    Prepends each line with its absolute line number so the LLM can orient
-    itself within the function (e.g. "line 347: if (diskId == \"\")").
+    Return only the source lines covering this batch's nodes ±padding lines.
+    Each line is annotated with its absolute line number for LLM orientation.
     """
     if not full_source or not batch:
-        return full_source
+        return ""
 
     lines = full_source.splitlines()
-
-    # Absolute line range for nodes in this batch
     min_abs = min(n.start_line for n in batch)
     max_abs = max(n.end_line for n in batch)
 
-    # Convert to 0-based indices within full_source
-    offset = func_start_line  # absolute line of full_source[0]
+    offset = func_start_line
     start_idx = max(0, min_abs - offset - padding)
     end_idx   = min(len(lines), max_abs - offset + padding + 1)
 
     excerpt_lines = lines[start_idx:end_idx]
-
-    # Annotate with absolute line numbers for LLM orientation
     abs_first = offset + start_idx
     numbered = [f"{abs_first + i}: {ln}" for i, ln in enumerate(excerpt_lines)]
-
     return "\n".join(numbered)
 
 
@@ -364,10 +405,9 @@ def _trim_context(context: str, budget: int) -> str:
     if len(context) <= budget:
         return context
     cutoff = max(0, budget - 60)
-    # Try to cut at a newline boundary
     newline_pos = context.rfind("\n", 0, cutoff)
     cut_at = newline_pos if newline_pos > cutoff // 2 else cutoff
-    return context[:cut_at] + "\n... [context trimmed to fit model window]"
+    return context[:cut_at] + "\n… [context trimmed to fit model window]"
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +419,7 @@ def _make_batches(nodes: List[CfgNode], batch_size: int) -> List[List[CfgNode]]:
 
 
 # ---------------------------------------------------------------------------
-# Targeted retry note
+# Targeted retry note (only used for parse / missing-node failures)
 # ---------------------------------------------------------------------------
 
 def _build_retry_note(failures: Dict[str, str]) -> str:
@@ -406,8 +446,8 @@ def _parse_partial(
     required_ids: Set[str],
 ) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
-    Parse LLM response and extract valid labels for as many nodes as possible.
-    Returns (accepted, failures) where failures maps node_id → reason string.
+    Parse LLM response and extract valid labels.
+    Returns (accepted, failures) maps.
     """
     accepted: Dict[str, str] = {}
     failures: Dict[str, str] = {}

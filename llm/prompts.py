@@ -151,7 +151,8 @@ def build_user_prompt(
     if context_packet:
         parts.append(f"\n--- Project Context ---\n{context_packet}")
 
-    parts.append(f"\n--- Function Source Code ---\n{source_code}")
+    if source_code and source_code.strip():
+        parts.append(f"\n--- Function Source Code ---\n{source_code}")
 
     # Build node descriptions for labeling
     node_list = _build_node_list(nodes)

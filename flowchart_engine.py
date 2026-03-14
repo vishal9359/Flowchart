@@ -101,8 +101,8 @@ def _parse_args() -> EngineConfig:
                    help="LLM request timeout in seconds (default: 120)")
     p.add_argument("--llm-retries", type=int, default=2,
                    help="LLM retry attempts on validation failure (default: 2)")
-    p.add_argument("--llm-batch-size", type=int, default=8,
-                   help="Nodes per LLM call (default: 8). Reduce for small-context models")
+    p.add_argument("--llm-batch-size", type=int, default=4,
+                   help="Nodes per LLM call (default: 4). Generator auto-halves on no-response.")
     p.add_argument("--llm-num-ctx", type=int, default=8192,
                    help="Ollama num_ctx (context window tokens, default: 8192). "
                         "Ollama defaults to 2048 which causes empty responses for "

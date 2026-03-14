@@ -127,6 +127,13 @@ class ProjectKnowledgeBase:
     def all_keys(self) -> List[str]:
         return list(self._functions.keys())
 
+    def get_function_phases(self, func_entry: FunctionEntry) -> List[Dict]:
+        """Return phase breakdown list for a function (empty if not available)."""
+        if not self._knowledge:
+            return []
+        fk = self._knowledge.functions.get(func_entry.qualified_name)
+        return fk.phases if fk and fk.phases else []
+
     # ------------------------------------------------------------------
     # Context packet construction (for LLM prompt injection)
     # ------------------------------------------------------------------
@@ -173,6 +180,17 @@ class ProjectKnowledgeBase:
             purpose = func_entry.description
         if purpose:
             sections.append(f"Purpose: {purpose}")
+
+        # ── 3b. Function phases (logical sections) ─────────────────────
+        phases = self.get_function_phases(func_entry)
+        if phases:
+            phase_lines = ["Function execution phases:"]
+            for i, phase in enumerate(phases, 1):
+                sl = phase.get("start_line", "?")
+                el = phase.get("end_line", "?")
+                desc = phase.get("description", "")
+                phase_lines.append(f"  Phase {i} (lines {sl}–{el}): {desc}")
+            sections.append("\n".join(phase_lines))
 
         # ── 4. 4-level callee call graph ───────────────────────────────
         callee_context = self._build_callee_bfs_context(func_entry, base_path)

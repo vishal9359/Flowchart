@@ -36,6 +36,10 @@ class FunctionKnowledge:
     # Qualified names of project functions this function calls (non-system).
     # Populated by project_scanner.py via CALL_EXPR traversal.
     calls: List[str] = field(default_factory=list)
+    # Phase-by-phase breakdown of the function body (from --llm-summarize).
+    # Each entry: {"start_line": N, "end_line": M, "description": "..."}
+    # Line numbers are relative to function start (1 = first line of function).
+    phases: List[Dict] = field(default_factory=list)
 
 
 @dataclass
@@ -205,6 +209,7 @@ def save_knowledge(knowledge: ProjectKnowledge, path: str) -> None:
                 "line": v.line,
                 "comment": v.comment,
                 "calls": v.calls,
+                "phases": v.phases,
             }
             for k, v in knowledge.functions.items()
         },
@@ -287,6 +292,7 @@ def load_knowledge(path: str) -> Optional[ProjectKnowledge]:
             line=v.get("line", 0),
             comment=v.get("comment", ""),
             calls=v.get("calls", []),
+            phases=v.get("phases", []),
         )
 
     for key, v in data.get("enums", {}).items():

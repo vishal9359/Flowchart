@@ -752,6 +752,18 @@ class HierarchySummarizer:
         "Return ONLY a JSON object: {\"FunctionName\": \"sentence.\", ...}. "
         "No markdown, no code fences, no extra text."
     )
+    _PHASE_SYSTEM = (
+        "You are a C++ code analyst. "
+        "Break the given function body into 2–6 logical phases (sequential sections). "
+        "For each phase, provide:\n"
+        "  - start_line: first line number (1 = first line of the body shown)\n"
+        "  - end_line: last line number of that phase\n"
+        "  - description: concise high-level description (max 12 words) of "
+        "what that section achieves — describe intent, not individual statements.\n"
+        "Return ONLY a valid JSON array: "
+        '[{"start_line": 1, "end_line": 5, "description": "..."}, ...]. '
+        "No markdown, no code fences, no extra text."
+    )
     _FILE_SYSTEM = (
         "You are a C++ software architect. "
         "Summarize the responsibility of the given source file in 2-3 sentences. "
@@ -787,6 +799,7 @@ class HierarchySummarizer:
         """Run all four summarization levels in order."""
         logger.info("── Hierarchy summarization starting ──")
         self._summarize_functions()
+        self._summarize_function_phases()
         self._summarize_files()
         self._summarize_modules()
         self._summarize_project()
@@ -851,6 +864,103 @@ class HierarchySummarizer:
         if not raw:
             return {}
         return self._parse_json_dict(raw)
+
+    # ------------------------------------------------------------------
+    # Level 1b — Function phase breakdown
+    # ------------------------------------------------------------------
+
+    # Minimum function body lines to justify phase generation.
+    _PHASE_MIN_LINES = 8
+
+    def _summarize_function_phases(self) -> None:
+        """
+        Generate phase-by-phase breakdowns for functions with enough body lines.
+
+        Phases describe what each logical section of a function achieves at a
+        high level (e.g., "Build JSON request body", "Validate and send request").
+        Only runs for functions with >= _PHASE_MIN_LINES lines.
+        """
+        seen_qnames: Set[str] = set()
+        eligible: List[FunctionKnowledge] = []
+        for fk in self._k.functions.values():
+            if fk.qualified_name not in seen_qnames and not fk.phases:
+                seen_qnames.add(fk.qualified_name)
+                body_lines = self._read_body(fk, max_lines=70)
+                if len(body_lines) >= self._PHASE_MIN_LINES:
+                    eligible.append(fk)
+
+        if not eligible:
+            logger.info("  No functions eligible for phase generation (need %d+ lines)",
+                        self._PHASE_MIN_LINES)
+            return
+
+        logger.info("  Generating phases for %d function(s) (>= %d lines)...",
+                    len(eligible), self._PHASE_MIN_LINES)
+
+        done = 0
+        for fk in eligible:
+            try:
+                phases = self._generate_phases(fk)
+                if phases:
+                    # Update all entries that share this qualified name
+                    for stored in self._k.functions.values():
+                        if stored.qualified_name == fk.qualified_name:
+                            stored.phases = phases
+            except Exception as exc:
+                logger.debug("  Phase generation failed for %s: %s",
+                             fk.qualified_name, exc)
+            done += 1
+            if done % 20 == 0 or done == len(eligible):
+                logger.info("  Phases: %d/%d", done, len(eligible))
+
+    def _generate_phases(self, fk: FunctionKnowledge) -> List[Dict]:
+        """Generate phase breakdown for one function via one LLM call."""
+        body_lines = self._read_body(fk, max_lines=60)
+        if not body_lines:
+            return []
+
+        numbered = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(body_lines))
+        prompt = (
+            f"Function: {fk.qualified_name}\n"
+            f"Signature: {fk.signature}\n\n"
+            f"Body (line numbers relative to function start):\n"
+            f"{numbered}\n\n"
+            "Identify 2–6 logical phases in this function body. "
+            "Each phase should describe what that section achieves at a high level."
+        )
+
+        raw = self._client.generate(self._PHASE_SYSTEM, prompt)
+        if not raw:
+            return []
+
+        # Parse JSON array from response
+        raw = re.sub(r"```(?:json)?\s*", "", raw)
+        raw = re.sub(r"```", "", raw)
+        start = raw.find("[")
+        if start == -1:
+            return []
+        depth = 0
+        for i in range(start, len(raw)):
+            if raw[i] == "[":
+                depth += 1
+            elif raw[i] == "]":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        phases = json.loads(raw[start:i + 1])
+                        if isinstance(phases, list):
+                            return [
+                                p for p in phases
+                                if isinstance(p, dict)
+                                and isinstance(p.get("start_line"), int)
+                                and isinstance(p.get("end_line"), int)
+                                and isinstance(p.get("description"), str)
+                                and p["description"]
+                            ]
+                    except Exception:
+                        pass
+                    break
+        return []
 
     # ------------------------------------------------------------------
     # Level 2 — File summaries

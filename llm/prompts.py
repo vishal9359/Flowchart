@@ -9,7 +9,7 @@ Design principles:
 """
 
 import json
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from models import CfgNode, NodeType
 
@@ -97,6 +97,37 @@ understand what each function call in the code actually does.
 9. BREAK / CONTINUE
    - Label: "Exit loop" for break, "Continue to next iteration" for continue
 
+=== ABSTRACTION GUIDELINE ===
+
+Think like a senior engineer reviewing this function — describe WHAT the code
+achieves, not HOW each statement is written.
+
+When consecutive ACTION nodes collectively accomplish one high-level task (e.g.,
+building a JSON object, initializing a struct, populating a request), each node's
+label should describe its contribution to that goal — not just repeat the
+statement literally.
+
+  Bad (too literal):
+    N3: "Call doc.SetObject()"
+    N4: "Call doc.AddMember with key initiator"
+    N5: "Call doc.AddMember with key count"
+  Good (high-level, using phase_hint and context):
+    N3: "Initialize JSON document as object"
+    N4: "Add initiator ID to JSON body"
+    N5: "Add I/O unit count to JSON body"
+
+If a node has a "phase_hint" field, use that description as the thematic
+framing for the label — it tells you what this section of code is trying to
+accomplish at a high level.
+
+If a node has "preceding_node_code" or "following_node_code", use them to
+understand whether this node is part of a sequence — and label it accordingly
+as a step in that sequence rather than in isolation.
+
+Non-negotiable output rule:
+  EVERY node_id listed in "Nodes to Label" MUST appear as a key in your JSON
+  output.  Do not skip any node, even simple ones.
+
 === STRICT RULES (NEVER VIOLATE) ===
 - Never rename or paraphrase function call names.
 - Never invent logic not present in the source code.
@@ -107,6 +138,8 @@ understand what each function call in the code actually does.
 - When macro_context is provided, use the macro value/meaning to enrich labels.
 - Do not add explanatory text outside the label itself.
 - Each <br/>-separated line in a label must be at most 40 characters.
+- Every node_id in "Nodes to Label" MUST have an entry in the output JSON.
+- Never skip a DECISION, LOOP_HEAD, SWITCH_HEAD, CASE, RETURN, BREAK, or CONTINUE node.
 
 === OUTPUT FORMAT ===
 Return ONLY a valid JSON object — no markdown, no code fences, no explanation.
@@ -128,6 +161,9 @@ def build_user_prompt(
     context_packet: str,
     source_code: str,
     nodes: List[CfgNode],
+    all_nodes: Optional[List[CfgNode]] = None,
+    phases: Optional[List[Dict]] = None,
+    func_start_line: int = 0,
 ) -> str:
     """
     Build the per-function user prompt.
@@ -136,7 +172,7 @@ def build_user_prompt(
       - Function identity (name + params)
       - Project context (PKB context packet)
       - Full function source
-      - Structured node list for labeling
+      - Structured node list for labeling (with neighbor context and phase hints)
     """
     parts: List[str] = []
 
@@ -155,7 +191,12 @@ def build_user_prompt(
         parts.append(f"\n--- Function Source Code ---\n{source_code}")
 
     # Build node descriptions for labeling
-    node_list = _build_node_list(nodes)
+    node_list = _build_node_list(
+        nodes,
+        all_nodes=all_nodes,
+        phases=phases,
+        func_start_line=func_start_line,
+    )
     node_json = json.dumps(node_list, indent=2)
     parts.append(f"\n--- Nodes to Label ---\n{node_json}")
 
@@ -166,8 +207,23 @@ def build_user_prompt(
     return "\n".join(parts)
 
 
-def _build_node_list(nodes: List[CfgNode]) -> List[Dict]:
-    """Convert CfgNodes into a structured list for the LLM prompt."""
+def _build_node_list(
+    nodes: List[CfgNode],
+    all_nodes: Optional[List[CfgNode]] = None,
+    phases: Optional[List[Dict]] = None,
+    func_start_line: int = 0,
+) -> List[Dict]:
+    """Convert CfgNodes into a structured list for the LLM prompt.
+
+    Adds:
+      - preceding_node_code / following_node_code  (Change 2: neighbor context)
+      - phase_hint                                  (Change 3: phase annotation)
+    """
+    # Build position map for neighbor lookup (all_nodes = full ordered list)
+    pos_map: Dict[str, int] = {}
+    if all_nodes:
+        pos_map = {n.node_id: i for i, n in enumerate(all_nodes)}
+
     result = []
     for node in nodes:
         # Skip structural nodes that don't need LLM labels
@@ -179,6 +235,30 @@ def _build_node_list(nodes: List[CfgNode]) -> List[Dict]:
             "type": node.node_type.value,
             "raw_code": node.raw_code[:200],  # cap per node
         }
+
+        # ── Neighbor context (Change 2) ──────────────────────────────
+        if all_nodes and node.node_id in pos_map:
+            idx = pos_map[node.node_id]
+            if idx > 0:
+                prev_node = all_nodes[idx - 1]
+                if prev_node.node_type not in (NodeType.START, NodeType.END):
+                    entry["preceding_node_code"] = _truncate(prev_node.raw_code, 80)
+            if idx < len(all_nodes) - 1:
+                next_node = all_nodes[idx + 1]
+                if next_node.node_type not in (NodeType.START, NodeType.END):
+                    entry["following_node_code"] = _truncate(next_node.raw_code, 80)
+
+        # ── Phase hint (Change 3) ────────────────────────────────────
+        if phases and func_start_line > 0:
+            rel_line = node.start_line - func_start_line + 1
+            for phase in phases:
+                ps = phase.get("start_line", 0)
+                pe = phase.get("end_line", 0)
+                if isinstance(ps, int) and isinstance(pe, int) and ps <= rel_line <= pe:
+                    desc = phase.get("description", "")
+                    if desc:
+                        entry["phase_hint"] = _truncate(desc, 80)
+                    break
 
         ctx = node.enriched_context
 

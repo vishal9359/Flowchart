@@ -108,6 +108,7 @@ class LabelGenerator:
             return
 
         context_packet = self._pkb.build_context_packet(func_entry, base_path)
+        phases = self._pkb.get_function_phases(func_entry)
 
         batches = _make_batches(labelable, self._batch_size)
         label_map: Dict[str, str] = {}
@@ -118,6 +119,8 @@ class LabelGenerator:
                 func_entry=func_entry,
                 context_packet=context_packet,
                 source_code=source_code,
+                all_nodes=labelable,
+                phases=phases,
             )
             label_map.update(batch_labels)
             logger.debug("Batch %d/%d done (%d nodes) for '%s'",
@@ -152,6 +155,8 @@ class LabelGenerator:
         func_entry: FunctionEntry,
         context_packet: str,
         source_code: str,
+        all_nodes: Optional[List[CfgNode]] = None,
+        phases: Optional[List[Dict]] = None,
         depth: int = 0,
     ) -> Dict[str, str]:
         """
@@ -164,6 +169,8 @@ class LabelGenerator:
             func_entry=func_entry,
             context_packet=context_packet,
             source_code=source_code,
+            all_nodes=all_nodes,
+            phases=phases,
         )
 
         if all_no_response and len(batch) > 1 and depth < _MAX_SPLIT_DEPTH:
@@ -177,6 +184,7 @@ class LabelGenerator:
             for sub_batch in [batch[:mid], batch[mid:]]:
                 sub_result = self._label_batch_with_split(
                     sub_batch, func_entry, context_packet, source_code,
+                    all_nodes=all_nodes, phases=phases,
                     depth=depth + 1,
                 )
                 combined.update(sub_result)
@@ -195,6 +203,8 @@ class LabelGenerator:
         func_entry: FunctionEntry,
         context_packet: str,
         source_code: str,
+        all_nodes: Optional[List[CfgNode]] = None,
+        phases: Optional[List[Dict]] = None,
     ) -> Tuple[Dict[str, str], bool]:
         """
         Label one batch of nodes.
@@ -210,6 +220,8 @@ class LabelGenerator:
             func_entry=func_entry,
             context_packet=context_packet,
             source_code=source_code,
+            all_nodes=all_nodes,
+            phases=phases,
         )
 
         total_chars = len(SYSTEM_PROMPT) + len(base_prompt)
@@ -307,6 +319,8 @@ def _build_size_aware_prompt(
     func_entry: FunctionEntry,
     context_packet: str,
     source_code: str,
+    all_nodes: Optional[List[CfgNode]] = None,
+    phases: Optional[List[Dict]] = None,
 ) -> str:
     """
     Build a prompt that fits within MAX_PROMPT_CHARS.
@@ -326,6 +340,9 @@ def _build_size_aware_prompt(
         context_packet=context_packet,
         source_code="",          # omit by default
         nodes=batch,
+        all_nodes=all_nodes,
+        phases=phases,
+        func_start_line=func_entry.line,
     )
 
     total_no_src = len(SYSTEM_PROMPT) + len(prompt_no_src)
@@ -340,6 +357,9 @@ def _build_size_aware_prompt(
             context_packet=context_packet,
             source_code=excerpt,
             nodes=batch,
+            all_nodes=all_nodes,
+            phases=phases,
+            func_start_line=func_entry.line,
         )
         if len(SYSTEM_PROMPT) + len(prompt_with_src) <= MAX_PROMPT_CHARS:
             return prompt_with_src   # full prompt with excerpt fits
@@ -360,6 +380,9 @@ def _build_size_aware_prompt(
         context_packet=trimmed_context,
         source_code="",
         nodes=batch,
+        all_nodes=all_nodes,
+        phases=phases,
+        func_start_line=func_entry.line,
     )
 
     final_total = len(SYSTEM_PROMPT) + len(prompt_trimmed)

@@ -35,3 +35,6 @@ class EngineConfig:
     llm_timeout: int = 120
     llm_max_retries: int = 2
     llm_temperature: float = 0.1
+    # Nodes per LLM call.  Reduce for small-context-window models (e.g. 4k).
+    # Each batch sends only the source lines of its nodes, not the full source.
+    llm_batch_size: int = 8

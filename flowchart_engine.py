@@ -101,6 +101,8 @@ def _parse_args() -> EngineConfig:
                    help="LLM request timeout in seconds (default: 120)")
     p.add_argument("--llm-retries", type=int, default=2,
                    help="LLM retry attempts on validation failure (default: 2)")
+    p.add_argument("--llm-batch-size", type=int, default=8,
+                   help="Nodes per LLM call (default: 8). Reduce for small-context models")
     p.add_argument("--max-stmts", type=int, default=3,
                    help="Max statements per ACTION node segment (default: 3)")
     p.add_argument("--max-lines", type=int, default=10,
@@ -129,6 +131,7 @@ def _parse_args() -> EngineConfig:
         llm_max_retries=args.llm_retries,
         max_stmts_per_segment=args.max_stmts,
         max_lines_per_segment=args.max_lines,
+        llm_batch_size=args.llm_batch_size,
     )
 
 
@@ -359,6 +362,7 @@ def run(config: EngineConfig) -> None:
         client=llm_client,
         pkb=pkb,
         max_retries=config.llm_max_retries,
+        batch_size=config.llm_batch_size,
     )
     writer = OutputWriter(config.out_dir)
 

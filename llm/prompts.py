@@ -176,39 +176,45 @@ def _build_node_list(nodes: List[CfgNode]) -> List[Dict]:
         entry: Dict = {
             "node_id": node.node_id,
             "type": node.node_type.value,
-            "raw_code": node.raw_code[:300],  # cap to avoid huge prompts
+            "raw_code": node.raw_code[:200],  # cap per node
         }
 
-        # Inject enriched context inline if available
         ctx = node.enriched_context
 
+        # Function calls — cap to 3 entries, each truncated to 120 chars
         if ctx.get("function_calls"):
             entry["called_functions"] = [
-                f"{c['signature']}: {c['description']}"
-                if c.get("description")
-                else c["signature"]
-                for c in ctx["function_calls"]
+                _truncate(
+                    f"{c['signature']}: {c['description']}"
+                    if c.get("description") else c["signature"],
+                    120,
+                )
+                for c in ctx["function_calls"][:3]
             ]
 
         if ctx.get("inline_comment"):
-            entry["source_comment"] = ctx["inline_comment"]
+            entry["source_comment"] = ctx["inline_comment"][:120]
 
-        # Enum constant meanings (from project_scanner knowledge)
+        # Cap list-valued context fields to 2 entries, each 80 chars
         if ctx.get("enum_context"):
-            entry["enum_context"] = ctx["enum_context"]
+            entry["enum_context"] = [_truncate(s, 80) for s in ctx["enum_context"][:2]]
 
-        # Macro constant values
         if ctx.get("macro_context"):
-            entry["macro_context"] = ctx["macro_context"]
+            entry["macro_context"] = [_truncate(s, 80) for s in ctx["macro_context"][:2]]
 
-        # Typedef / alias meanings
         if ctx.get("typedef_context"):
-            entry["typedef_context"] = ctx["typedef_context"]
+            entry["typedef_context"] = [_truncate(s, 80) for s in ctx["typedef_context"][:2]]
 
-        # Struct/class member field meanings
         if ctx.get("struct_member_context"):
-            entry["struct_member_context"] = ctx["struct_member_context"]
+            entry["struct_member_context"] = [_truncate(s, 80) for s in ctx["struct_member_context"][:2]]
 
         result.append(entry)
 
     return result
+
+
+def _truncate(s: str, max_chars: int) -> str:
+    """Truncate a string to max_chars, appending '…' if truncated."""
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars - 1] + "…"

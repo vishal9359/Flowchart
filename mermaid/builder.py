@@ -77,6 +77,7 @@ def _node_def(node: CfgNode) -> str:
     by _escape_label(), so no delimiters are needed.
     """
     label = node.label or node.raw_code[:60] or node.node_id
+    label = _enforce_line_length(label)
     escaped = _escape_label(label)
 
     nid = node.node_id
@@ -211,6 +212,67 @@ _NODE_LABEL_RE  = re.compile("[&\"\\[\\](){}|;%^~<>]")
 _EDGE_LABEL_RE  = re.compile("[&\"\\[\\](){}|;<>]")
 
 _BR_PLACEHOLDER = "\x00BR\x00"
+
+# Maximum characters per visual line in a Mermaid node label.
+# Mermaid's SVG renderer does NOT word-wrap within a line; it only breaks
+# at explicit <br/> tags.  If a line is too long it extends beyond the node
+# boundary and wraps awkwardly when the browser wraps the SVG text element.
+# This limit is applied mechanically AFTER the LLM generates labels so that
+# even labels that violate the system-prompt guideline are fixed before render.
+_MAX_LINE_CHARS = 40
+
+
+def _enforce_line_length(label: str, max_chars: int = _MAX_LINE_CHARS) -> str:
+    """
+    Ensure no <br/>-separated segment exceeds max_chars characters.
+
+    Algorithm:
+      1. Split label on existing <br/> tags.
+      2. For each segment, if it is longer than max_chars, word-wrap it:
+         break at the last space that keeps the current chunk ≤ max_chars,
+         inserting a <br/> at each break point.
+      3. Rejoin all segments with <br/>.
+
+    Words longer than max_chars are never broken mid-word to avoid
+    corrupting function names or technical terms.
+    """
+    if not label:
+        return label
+
+    # Normalise <br /> → <br/>
+    label = label.replace("<br />", "<br/>")
+    segments = label.split("<br/>")
+
+    result_segments: List[str] = []
+    for seg in segments:
+        seg = seg.strip()
+        if len(seg) <= max_chars:
+            result_segments.append(seg)
+            continue
+
+        # Word-wrap this segment
+        words = seg.split(" ")
+        current_line: List[str] = []
+        current_len = 0
+        wrapped: List[str] = []
+
+        for word in words:
+            # +1 for the space before the word (except at start of line)
+            addition = len(word) + (1 if current_line else 0)
+            if current_line and current_len + addition > max_chars:
+                wrapped.append(" ".join(current_line))
+                current_line = [word]
+                current_len = len(word)
+            else:
+                current_line.append(word)
+                current_len += addition
+
+        if current_line:
+            wrapped.append(" ".join(current_line))
+
+        result_segments.extend(wrapped)
+
+    return "<br/>".join(result_segments)
 
 
 def _escape_label(text: str) -> str:

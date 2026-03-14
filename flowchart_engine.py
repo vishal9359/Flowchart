@@ -101,8 +101,8 @@ def _parse_args() -> EngineConfig:
                    help="LLM request timeout in seconds (default: 120)")
     p.add_argument("--llm-retries", type=int, default=2,
                    help="LLM retry attempts on validation failure (default: 2)")
-    p.add_argument("--max-stmts", type=int, default=5,
-                   help="Max statements per ACTION node segment (default: 5)")
+    p.add_argument("--max-stmts", type=int, default=3,
+                   help="Max statements per ACTION node segment (default: 3)")
     p.add_argument("--max-lines", type=int, default=10,
                    help="Max source lines per ACTION node segment (default: 10)")
     p.add_argument("--verbose", "-v", action="store_true",

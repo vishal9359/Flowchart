@@ -46,9 +46,16 @@ understand what each function call in the code actually does.
 
 2. ACTION nodes  (non-decision sequential code)
    - Short imperative sentence(s), max 10 words per line.
-   - Use <br/> to separate distinct actions if the node contains multiple statements.
-   - Maximum 3 lines per label.
+   - Each line separated by <br/> must be AT MOST 40 characters long.
+     If a description naturally exceeds 40 characters, split it at a logical
+     word boundary and continue on the next <br/> line.
+   - Maximum 3 lines per label (3 <br/>-separated segments).
    - Preserve exact function call names exactly as they appear in code.
+   - MANDATORY: If the node has a "called_functions" list, your label MUST
+     explicitly name at least one of those functions.  Never omit a project
+     function call that appears in called_functions.
+     Example: called_functions contains "ServerReplicate" → label must say
+     "Call ServerReplicate(...)" or "Replicate server state via ServerReplicate"
    - For assignment statements (obj.field = val, var = expr), write as:
        "Set <left-hand side description> to <right-hand side description>"
      Use struct_member_context (when provided) to find the meaning of the field.
@@ -61,7 +68,7 @@ understand what each function call in the code actually does.
 
 3. DECISION nodes  (if-conditions, loop conditions, switch)
    - Must be phrased as a Yes/No question ending with "?".
-   - Keep it concise — one line if possible.
+   - Keep it concise — one line if possible, at most 40 characters.
    - Use project hierarchy context to translate domain variables and constants to English.
    - If callee context or macro context explains a constant, use that meaning.
    - For unknown function calls, infer intent from camelCase decomposition of the name.
@@ -70,6 +77,7 @@ understand what each function call in the code actually does.
 
 4. LOOP_HEAD nodes  (for / while / do-while conditions)
    - Phrase as a question or iteration statement ending with "?".
+   - At most 40 characters.
    - Example: "For each worker in worker list?" or "While queue is not empty?"
 
 5. SWITCH_HEAD nodes
@@ -94,16 +102,18 @@ understand what each function call in the code actually does.
 - Never invent logic not present in the source code.
 - Use project hierarchy terminology ([Project], [Module], [File]) to inform labels.
 - Use callee descriptions from "Called Functions Context" to understand what calls do.
+- When a node has called_functions, the label MUST name at least one of those functions.
 - When struct_member_context is provided, use the member descriptions to enrich labels.
 - When macro_context is provided, use the macro value/meaning to enrich labels.
 - Do not add explanatory text outside the label itself.
+- Each <br/>-separated line in a label must be at most 40 characters.
 
 === OUTPUT FORMAT ===
 Return ONLY a valid JSON object — no markdown, no code fences, no explanation.
 Keys are node_id strings. Values are label strings.
 
 Example:
-{"N2": "Is rate limit exceeded for event?", "N3": "Return 1 (limit exceeded)", "N4": "Return 0 (within limit)"}
+{"N2": "Is rate limit exceeded?", "N3": "Return 1 (limit exceeded)", "N4": "Return 0 (within limit)"}
 """
 
 

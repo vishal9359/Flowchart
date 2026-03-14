@@ -22,8 +22,10 @@ class EngineConfig:
     use_cache: bool = True
     cache_dir: str = ".flowchart_cache"
 
-    # Statement segment thresholds per ACTION node
-    max_stmts_per_segment: int = 5
+    # Statement segment thresholds per ACTION node.
+    # Reduced to 3 statements so that important function calls are unlikely
+    # to be buried in a large segment where the LLM may omit them from the label.
+    max_stmts_per_segment: int = 3
     max_lines_per_segment: int = 10
 
     # Optional: path to project_knowledge.json built by project_scanner.py

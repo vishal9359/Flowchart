@@ -38,3 +38,7 @@ class EngineConfig:
     # Nodes per LLM call.  Reduce for small-context-window models (e.g. 4k).
     # Each batch sends only the source lines of its nodes, not the full source.
     llm_batch_size: int = 8
+    # Ollama num_ctx: explicitly sets the model's context window for each call.
+    # Ollama defaults to 2048 for many models; prompts >2048 tokens return empty.
+    # Set to 8192 to safely handle all prompt sizes up to ~2500 tokens.
+    llm_num_ctx: int = 8192

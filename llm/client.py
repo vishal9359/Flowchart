@@ -1,12 +1,21 @@
 """
 Local LLM HTTP client.
 
-Compatible with Ollama's /api/generate endpoint.
-For OpenAI-compatible servers, set llm_url to their chat/completions endpoint
-and set use_openai_format=True in the constructor.
+Compatible with Ollama's /api/generate endpoint and OpenAI-compatible servers.
+
+Key parameter: num_ctx
+----------------------
+Ollama defaults num_ctx (the model's context window) to 2048 tokens for many
+models.  Our prompts are 2000–2500 tokens for medium-sized functions, which
+exceeds that default.  When the prompt exceeds num_ctx Ollama returns an empty
+response string immediately — which maps to None in generate() and causes the
+"no LLM response" warning.
+
+The fix: always pass num_ctx explicitly in the Ollama options so the model
+loads with a sufficient context window.  Default is 8192 tokens; configurable
+via --llm-num-ctx on the CLI.
 """
 
-import json
 import logging
 from typing import Optional
 
@@ -27,17 +36,19 @@ class LlmClient:
     def __init__(self, url: str, model: str,
                  timeout: int = 120,
                  temperature: float = 0.1,
+                 num_ctx: int = 8192,
                  use_openai_format: bool = False) -> None:
         self._url = url
         self._model = model
         self._timeout = timeout
         self._temperature = temperature
+        self._num_ctx = num_ctx
         self._openai = use_openai_format
 
     def generate(self, system_prompt: str, user_prompt: str) -> Optional[str]:
         """
         Call the LLM and return the raw text response.
-        Returns None on any failure (timeout, HTTP error, etc.).
+        Returns None on any failure (timeout, HTTP error, empty response, etc.).
         """
         try:
             if self._openai:
@@ -65,6 +76,11 @@ class LlmClient:
             "prompt": user,
             "stream": False,
             "options": {
+                # num_ctx: explicitly set the context window size.
+                # Without this, Ollama uses the model's baked-in default
+                # which is often 2048 tokens.  Prompts that exceed num_ctx
+                # cause Ollama to return an empty response string immediately.
+                "num_ctx": self._num_ctx,
                 "temperature": self._temperature,
                 "top_p": 0.9,
                 "num_predict": 2048,
@@ -73,7 +89,13 @@ class LlmClient:
         resp = requests.post(self._url, json=payload, timeout=self._timeout)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("response", "").strip() or None
+
+        response_text = data.get("response", "").strip()
+        if not response_text:
+            # Log the full server response at DEBUG level to aid diagnosis
+            logger.debug("Ollama returned empty response. Server data: %s",
+                         str(data)[:300])
+        return response_text or None
 
     # ------------------------------------------------------------------
     # OpenAI-compatible format

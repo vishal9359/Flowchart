@@ -103,6 +103,10 @@ def _parse_args() -> EngineConfig:
                    help="LLM retry attempts on validation failure (default: 2)")
     p.add_argument("--llm-batch-size", type=int, default=8,
                    help="Nodes per LLM call (default: 8). Reduce for small-context models")
+    p.add_argument("--llm-num-ctx", type=int, default=8192,
+                   help="Ollama num_ctx (context window tokens, default: 8192). "
+                        "Ollama defaults to 2048 which causes empty responses for "
+                        "prompts >2048 tokens. Set higher for large functions.")
     p.add_argument("--max-stmts", type=int, default=3,
                    help="Max statements per ACTION node segment (default: 3)")
     p.add_argument("--max-lines", type=int, default=10,
@@ -132,6 +136,7 @@ def _parse_args() -> EngineConfig:
         max_stmts_per_segment=args.max_stmts,
         max_lines_per_segment=args.max_lines,
         llm_batch_size=args.llm_batch_size,
+        llm_num_ctx=args.llm_num_ctx,
     )
 
 
@@ -357,6 +362,7 @@ def run(config: EngineConfig) -> None:
         model=config.llm_model,
         timeout=config.llm_timeout,
         temperature=config.llm_temperature,
+        num_ctx=config.llm_num_ctx,
     )
     label_generator = LabelGenerator(
         client=llm_client,

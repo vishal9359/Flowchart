@@ -12,7 +12,7 @@ Output JSON schema (per file):
   {
     "functionKey": "src|qos_event_manager|pos::QosEventManager::_RateLimit|...",
     "qualifiedName": "pos::QosEventManager::_RateLimit",
-    "mermaidScript": "flowchart TD\n    ..."
+    "flowchart": "flowchart TD\n    ..."
   },
   ...
 ]
@@ -100,7 +100,7 @@ def _serialize_file_result(file_result: FileResult) -> List[Dict]:
         entry: Dict = {
             "functionKey": fc.function_key,
             "qualifiedName": fc.qualified_name,
-            "mermaidScript": fc.mermaid_script,
+            "flowchart": fc.mermaid_script,
         }
         if fc.error:
             entry["error"] = fc.error

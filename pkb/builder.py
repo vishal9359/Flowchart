@@ -252,11 +252,13 @@ class ProjectKnowledgeBase:
     def build_context_packet(self, func_entry: FunctionEntry,
                               base_path: str) -> str:
         """
-        Full context packet including 4-level BFS callee graph.
+        Full context packet: base (hierarchy + callers + purpose + phases)
+        plus the 4-level BFS callee graph as a broad baseline.
 
-        Kept for backward compatibility.  The label generator now uses
-        build_base_context_packet() + build_targeted_callee_context() instead,
-        which gives more focused, per-batch callee context.
+        This is what label_cfg() uses as base_context.  Per-batch targeted
+        callee context is added ON TOP in _label_batch() via
+        build_targeted_callee_context(), so callee context is always present
+        even when enriched_context["function_calls"] is empty.
         """
         base = self.build_base_context_packet(func_entry, base_path)
         callee = self._build_callee_bfs_context(func_entry, base_path)

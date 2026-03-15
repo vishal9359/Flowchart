@@ -41,6 +41,7 @@ BATCH_SIZE        — default nodes per LLM call.
 
 import json
 import logging
+import os
 import re
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -117,14 +118,16 @@ class LabelGenerator:
         # Order labelable nodes in CFG execution order (topological sort).
         # This ensures neighbor context (preceding/following_node_code) is meaningful
         # and region batching groups semantically related sequential nodes together.
-        topo_ids = _topo_sort(cfg)
+        # back_edges is returned so _make_region_batches can exclude loop back-edges
+        # from predecessor counts (otherwise loop headers appear as merge points).
+        topo_ids, back_edges = _topo_sort(cfg)
         labelable_ids = {n.node_id for n in labelable}
         node_by_id = {n.node_id: n for n in labelable}
         ordered_labelable = [node_by_id[nid] for nid in topo_ids if nid in labelable_ids]
 
         # CFG-region-aware batching: group nodes that belong to the same sequential
         # region (basic-block-like), so the LLM labels a coherent block at a time.
-        batches = _make_region_batches(ordered_labelable, cfg, self._batch_size)
+        batches = _make_region_batches(ordered_labelable, cfg, self._batch_size, back_edges)
         label_map: Dict[str, str] = {}
 
         for batch_idx, batch in enumerate(batches):
@@ -254,7 +257,6 @@ class LabelGenerator:
         logger.debug("Batch prompt: %d chars (~%d tokens) for %d nodes",
                      total_chars, total_chars // 4, len(batch))
         # Print full prompt at TRACE level (set env FLOWCHART_TRACE=1 to enable)
-        import os
         if os.environ.get("FLOWCHART_TRACE"):
             print("\n" + "="*60)
             print(f"[TRACE] SYSTEM PROMPT:\n{SYSTEM_PROMPT[:500]}...")
@@ -582,13 +584,19 @@ def _make_batches(nodes: List[CfgNode], batch_size: int) -> List[List[CfgNode]]:
 # CFG topological sort
 # ---------------------------------------------------------------------------
 
-def _topo_sort(cfg: ControlFlowGraph) -> List[str]:
+def _topo_sort(cfg: ControlFlowGraph) -> Tuple[List[str], Set[Tuple[str, str]]]:
     """
-    DFS post-order topological sort of the CFG.
+    Iterative DFS post-order topological sort of the CFG.
 
-    Handles cycles (loop back-edges) by skipping already-in-stack nodes.
-    Returns node IDs in execution order (entry first).
-    Nodes unreachable from entry_node_id are appended at the end.
+    Handles cycles (loop back-edges) by detecting nodes already on the DFS
+    stack.  Back-edges are recorded and returned so callers can exclude them
+    from predecessor-count calculations (avoiding false merge-point detection
+    on loop headers).
+
+    Returns:
+        (order, back_edges) where:
+          order      — node IDs in execution order (entry first)
+          back_edges — set of (source, target) pairs that are back-edges
     """
     succ: Dict[str, List[str]] = {nid: [] for nid in cfg.nodes}
     for edge in cfg.edges:
@@ -596,29 +604,48 @@ def _topo_sort(cfg: ControlFlowGraph) -> List[str]:
             succ[edge.source].append(edge.target)
 
     visited: Set[str] = set()
+    in_stack: Set[str] = set()
     order: List[str] = []
+    back_edges: Set[Tuple[str, str]] = set()
 
-    def _dfs(nid: str, in_stack: Set[str]) -> None:
-        if nid in visited or nid not in cfg.nodes:
-            return
-        if nid in in_stack:   # back-edge (loop) — skip to break cycle
-            return
-        in_stack.add(nid)
-        visited.add(nid)
-        for child in succ.get(nid, []):
-            _dfs(child, in_stack)
-        in_stack.discard(nid)
-        order.append(nid)
+    def _iterative_dfs(start: str) -> None:
+        # Each stack frame: (node_id, iterator_over_children, entered_stack)
+        # We push (nid, iter(children), False) and when we pop with
+        # entered_stack=True we finalize the node (post-order).
+        stack: List[Tuple[str, object, bool]] = [(start, iter(succ.get(start, [])), True)]
+        in_stack.add(start)
+        visited.add(start)
+
+        while stack:
+            nid, children_iter, _ = stack[-1]
+            try:
+                child = next(children_iter)  # type: ignore[arg-type]
+                if child not in cfg.nodes:
+                    continue
+                if child in in_stack:
+                    # Back-edge — record it but do NOT recurse
+                    back_edges.add((nid, child))
+                    continue
+                if child in visited:
+                    continue
+                visited.add(child)
+                in_stack.add(child)
+                stack.append((child, iter(succ.get(child, [])), True))
+            except StopIteration:
+                # All children processed — finalize this node
+                stack.pop()
+                in_stack.discard(nid)
+                order.append(nid)
 
     entry = cfg.entry_node_id
     if entry and entry in cfg.nodes:
-        _dfs(entry, set())
+        _iterative_dfs(entry)
     for nid in cfg.nodes:
         if nid not in visited:
-            _dfs(nid, set())
+            _iterative_dfs(nid)
 
     order.reverse()
-    return order
+    return order, back_edges
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +666,7 @@ def _make_region_batches(
     ordered_nodes: List[CfgNode],
     cfg: ControlFlowGraph,
     batch_size: int,
+    back_edges: Optional[Set[Tuple[str, str]]] = None,
 ) -> List[List[CfgNode]]:
     """
     Group CFG nodes into batches that respect basic-block boundaries.
@@ -652,12 +680,22 @@ def _make_region_batches(
     build a JSON document) together in one batch, giving the LLM the full
     context it needs to write coherent high-level labels.
 
+    back_edges: set of (source, target) back-edges from _topo_sort().
+    These are excluded from predecessor counting so that loop headers are
+    NOT falsely treated as merge points (they only have one forward-edge
+    predecessor; the back-edge comes from the loop body).
+
     Tiny single-node batches are merged with their neighbour where possible.
     """
-    # Count predecessors for every node so we can detect merge points
+    # Count forward-edge predecessors only (exclude back-edges).
+    # A true merge point is one where control flows in from 2+ different
+    # forward paths (e.g., after an if/else).  Loop headers only have ONE
+    # forward predecessor (the code before the loop) — the second edge is
+    # a back-edge from the loop body and must not inflate the count.
+    _back = back_edges or set()
     pred_count: Dict[str, int] = {nid: 0 for nid in cfg.nodes}
     for edge in cfg.edges:
-        if edge.target in pred_count:
+        if (edge.source, edge.target) not in _back and edge.target in pred_count:
             pred_count[edge.target] += 1
 
     batches: List[List[CfgNode]] = []

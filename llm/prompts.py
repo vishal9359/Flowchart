@@ -150,9 +150,10 @@ Example: if "doc" appears in N3, N4, N5 as data_flow_shared, label them as
 sequential steps building the same document: "Initialize doc", "Add X to doc",
 "Add Y to doc" — not as isolated statements.
 
-If a node has "called_by" context, those are the higher-level functions that
-invoke the current function.  Use them to understand the semantic purpose
-of this function from the caller's perspective.
+If the Project Context contains a "Called by" section, those are the
+higher-level functions that invoke the current function.  Use them to
+understand the semantic purpose of this function from the caller's
+perspective.
 
 Non-negotiable output rule:
   EVERY node_id listed in "Nodes to Label" MUST appear as a key in your JSON

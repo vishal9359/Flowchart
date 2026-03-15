@@ -43,10 +43,22 @@ class ProjectKnowledgeBase:
         self._functions: Dict[str, FunctionEntry] = {}
         self._by_qualified_name: Dict[str, List[str]] = {}
         self._knowledge: Optional[ProjectKnowledge] = None
+        # Short-name → FunctionKnowledge (built lazily in load_project_knowledge)
+        # Enables O(1) lookup in build_targeted_callee_context instead of O(n) scan.
+        self._knowledge_by_short_name: Dict[str, "FunctionKnowledge"] = {}
 
     def load_project_knowledge(self, knowledge: ProjectKnowledge) -> None:
         """Attach a ProjectKnowledge (from project_scanner.py) for richer context."""
         self._knowledge = knowledge
+        # Build short-name index: last segment after '::' → FunctionKnowledge
+        # On collision (two functions with the same short name), keep the first
+        # match (arbitrary but stable). build_targeted_callee_context falls back
+        # to exact qualified-name lookup, so collisions rarely matter.
+        self._knowledge_by_short_name = {}
+        for qname, fk in knowledge.functions.items():
+            short = qname.split("::")[-1].split("(")[0].strip()
+            if short and short not in self._knowledge_by_short_name:
+                self._knowledge_by_short_name[short] = fk
         logger.info("Project knowledge attached to PKB: %s", knowledge.stats())
 
     # ------------------------------------------------------------------
@@ -224,12 +236,9 @@ class ProjectKnowledgeBase:
             # 1. Exact qualified-name match
             fk = self._knowledge.functions.get(name)
             if not fk:
-                # 2. Short-name fallback (strip namespaces)
+                # 2. Short-name fallback — O(1) via pre-built index
                 short = name.split("::")[-1].split("(")[0].strip()
-                for qname, stored in self._knowledge.functions.items():
-                    if qname.split("::")[-1] == short:
-                        fk = stored
-                        break
+                fk = self._knowledge_by_short_name.get(short)
 
             if fk and fk.qualified_name not in seen:
                 seen.add(fk.qualified_name)

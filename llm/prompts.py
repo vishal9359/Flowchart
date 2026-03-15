@@ -9,9 +9,27 @@ Design principles:
 """
 
 import json
-from typing import Dict, List, Optional
+import re
+from typing import Dict, List, Optional, Set
 
 from models import CfgNode, NodeType
+
+
+# ---------------------------------------------------------------------------
+# C++ keywords to exclude from data-flow identifier extraction
+# ---------------------------------------------------------------------------
+
+_CPP_KEYWORDS: Set[str] = {
+    "if", "else", "while", "for", "do", "switch", "case", "default",
+    "return", "break", "continue", "goto", "throw", "try", "catch",
+    "new", "delete", "nullptr", "true", "false", "this", "class", "struct",
+    "public", "private", "protected", "virtual", "override", "const",
+    "static", "auto", "int", "void", "bool", "char", "double", "float",
+    "long", "short", "unsigned", "signed", "namespace", "using", "typedef",
+    "template", "typename", "operator", "sizeof", "decltype", "explicit",
+    "inline", "extern", "volatile", "enum", "union", "std", "nullptr",
+    "and", "or", "not", "xor", "bitand", "bitor", "compl",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +142,18 @@ If a node has "preceding_node_code" or "following_node_code", use them to
 understand whether this node is part of a sequence — and label it accordingly
 as a step in that sequence rather than in isolation.
 
+If a node has "data_flow_shared", those are variable/object names that appear
+in multiple nodes in this batch — they represent shared state being built up
+across the sequence.  Use this to understand the collective purpose of the
+group and label each node as a step contributing to that shared goal.
+Example: if "doc" appears in N3, N4, N5 as data_flow_shared, label them as
+sequential steps building the same document: "Initialize doc", "Add X to doc",
+"Add Y to doc" — not as isolated statements.
+
+If a node has "called_by" context, those are the higher-level functions that
+invoke the current function.  Use them to understand the semantic purpose
+of this function from the caller's perspective.
+
 Non-negotiable output rule:
   EVERY node_id listed in "Nodes to Label" MUST appear as a key in your JSON
   output.  Do not skip any node, even simple ones.
@@ -216,13 +246,28 @@ def _build_node_list(
     """Convert CfgNodes into a structured list for the LLM prompt.
 
     Adds:
-      - preceding_node_code / following_node_code  (Change 2: neighbor context)
-      - phase_hint                                  (Change 3: phase annotation)
+      - preceding_node_code / following_node_code  (neighbor context)
+      - phase_hint                                  (phase annotation)
+      - data_flow_shared                            (identifiers shared across batch)
     """
     # Build position map for neighbor lookup (all_nodes = full ordered list)
     pos_map: Dict[str, int] = {}
     if all_nodes:
         pos_map = {n.node_id: i for i, n in enumerate(all_nodes)}
+
+    # ── Data-flow hint: find identifiers shared across ≥2 nodes in this batch ──
+    # Identifier → set of node_ids that reference it
+    ident_to_nodes: Dict[str, Set[str]] = {}
+    for node in nodes:
+        if node.node_type in (NodeType.START, NodeType.END):
+            continue
+        for ident in _extract_code_identifiers(node.raw_code):
+            ident_to_nodes.setdefault(ident, set()).add(node.node_id)
+    # Only keep identifiers that appear in 2+ nodes (the "shared" ones)
+    shared_idents: Set[str] = {
+        ident for ident, node_ids in ident_to_nodes.items()
+        if len(node_ids) >= 2
+    }
 
     result = []
     for node in nodes:
@@ -248,7 +293,7 @@ def _build_node_list(
                 if next_node.node_type not in (NodeType.START, NodeType.END):
                     entry["following_node_code"] = _truncate(next_node.raw_code, 80)
 
-        # ── Phase hint (Change 3) ────────────────────────────────────
+        # ── Phase hint ───────────────────────────────────────────────
         if phases and func_start_line > 0:
             rel_line = node.start_line - func_start_line + 1
             for phase in phases:
@@ -259,6 +304,14 @@ def _build_node_list(
                     if desc:
                         entry["phase_hint"] = _truncate(desc, 80)
                     break
+
+        # ── Data-flow hint ───────────────────────────────────────────
+        # Variables/objects this node shares with other nodes in the batch.
+        # Tells the LLM "these nodes all work on the same object/state" so it
+        # labels them as steps in a coherent sequence rather than in isolation.
+        node_shared = _extract_code_identifiers(node.raw_code) & shared_idents
+        if node_shared:
+            entry["data_flow_shared"] = sorted(node_shared)[:5]
 
         ctx = node.enriched_context
 
@@ -292,6 +345,23 @@ def _build_node_list(
         result.append(entry)
 
     return result
+
+
+def _extract_code_identifiers(code: str) -> Set[str]:
+    """
+    Extract meaningful variable/object identifiers from C++ raw_code.
+
+    Filters out C++ keywords, single-character names, and pure numeric tokens.
+    Used for data-flow hint computation: identifiers that appear in multiple
+    nodes within a batch indicate shared state the LLM should group together.
+    """
+    tokens = re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\b', code)
+    return {
+        t for t in tokens
+        if t not in _CPP_KEYWORDS and len(t) > 2 and not t.isupper()
+    }
+    # Note: isupper() filters ALL-CAPS macros (LOG_ERROR, MAX_RETRY_COUNT)
+    # which are constants, not variable/object identifiers.
 
 
 def _truncate(s: str, max_chars: int) -> str:

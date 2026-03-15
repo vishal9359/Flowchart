@@ -107,25 +107,41 @@ class LabelGenerator:
         if not labelable:
             return
 
-        context_packet = self._pkb.build_context_packet(func_entry, base_path)
+        # Build static (per-function) context — hierarchy + callers + purpose + phases.
+        # Callee context is added per-batch in _label_batch() for better targeting.
+        base_context = self._pkb.build_base_context_packet(func_entry, base_path)
         phases = self._pkb.get_function_phases(func_entry)
 
-        batches = _make_batches(labelable, self._batch_size)
+        # Order labelable nodes in CFG execution order (topological sort).
+        # This ensures neighbor context (preceding/following_node_code) is meaningful
+        # and region batching groups semantically related sequential nodes together.
+        topo_ids = _topo_sort(cfg)
+        labelable_ids = {n.node_id for n in labelable}
+        node_by_id = {n.node_id: n for n in labelable}
+        ordered_labelable = [node_by_id[nid] for nid in topo_ids if nid in labelable_ids]
+
+        # CFG-region-aware batching: group nodes that belong to the same sequential
+        # region (basic-block-like), so the LLM labels a coherent block at a time.
+        batches = _make_region_batches(ordered_labelable, cfg, self._batch_size)
         label_map: Dict[str, str] = {}
 
         for batch_idx, batch in enumerate(batches):
             batch_labels = self._label_batch_with_split(
                 batch=batch,
                 func_entry=func_entry,
-                context_packet=context_packet,
+                base_context=base_context,
                 source_code=source_code,
-                all_nodes=labelable,
+                all_nodes=ordered_labelable,
                 phases=phases,
             )
             label_map.update(batch_labels)
             logger.debug("Batch %d/%d done (%d nodes) for '%s'",
                          batch_idx + 1, len(batches), len(batch),
                          func_entry.qualified_name)
+
+        # Coherence pass: normalize terminology and phrasing across all labels.
+        if len(label_map) >= 5:
+            label_map = self._coherence_pass(cfg, func_entry, label_map, ordered_labelable)
 
         self._apply_labels(cfg, label_map)
 
@@ -153,7 +169,7 @@ class LabelGenerator:
         self,
         batch: List[CfgNode],
         func_entry: FunctionEntry,
-        context_packet: str,
+        base_context: str,
         source_code: str,
         all_nodes: Optional[List[CfgNode]] = None,
         phases: Optional[List[Dict]] = None,
@@ -167,7 +183,7 @@ class LabelGenerator:
         result, all_no_response = self._label_batch(
             batch=batch,
             func_entry=func_entry,
-            context_packet=context_packet,
+            base_context=base_context,
             source_code=source_code,
             all_nodes=all_nodes,
             phases=phases,
@@ -183,12 +199,11 @@ class LabelGenerator:
             combined: Dict[str, str] = {}
             for sub_batch in [batch[:mid], batch[mid:]]:
                 sub_result = self._label_batch_with_split(
-                    sub_batch, func_entry, context_packet, source_code,
+                    sub_batch, func_entry, base_context, source_code,
                     all_nodes=all_nodes, phases=phases,
                     depth=depth + 1,
                 )
                 combined.update(sub_result)
-            # combined overrides fallback labels set by the failed full batch
             return combined
 
         return result
@@ -201,7 +216,7 @@ class LabelGenerator:
         self,
         batch: List[CfgNode],
         func_entry: FunctionEntry,
-        context_packet: str,
+        base_context: str,
         source_code: str,
         all_nodes: Optional[List[CfgNode]] = None,
         phases: Optional[List[Dict]] = None,
@@ -209,12 +224,21 @@ class LabelGenerator:
         """
         Label one batch of nodes.
 
+        Builds a batch-specific context packet by combining the static base
+        context (hierarchy, callers, purpose, phases) with targeted callee
+        context for only the functions actually called in this batch.
+
         Returns (label_map, all_no_response) where:
           all_no_response=True  → every attempt returned None (server issue /
                                   context overflow) — caller should auto-halve.
           all_no_response=False → at least one attempt got a response (even if
                                   partial) — fallback labels are already set.
         """
+        # Targeted callee context: only inject callees used in THIS batch.
+        callee_names = _extract_batch_callee_names(batch)
+        callee_ctx = self._pkb.build_targeted_callee_context(func_entry, callee_names)
+        context_packet = base_context + ("\n" + callee_ctx if callee_ctx else "")
+
         base_prompt = _build_size_aware_prompt(
             batch=batch,
             func_entry=func_entry,
@@ -297,6 +321,109 @@ class LabelGenerator:
                 )
 
         return accumulated, all_no_response
+
+    # ------------------------------------------------------------------
+    # Coherence pass — normalize all labels after per-batch generation
+    # ------------------------------------------------------------------
+
+    _COHERENCE_SYSTEM = (
+        "You are a technical editor reviewing flowchart labels for a C++ function. "
+        "Fix ONLY: inconsistent terminology, non-active-voice phrasing, or labels "
+        "that break the narrative flow when read in sequence. "
+        "Do NOT change meanings, do NOT re-label nodes that are already good. "
+        'Return ONLY a JSON object for labels you changed: {"node_id": "improved_label"}. '
+        "Return {} if nothing needs changing. No markdown, no explanations."
+    )
+
+    def _coherence_pass(
+        self,
+        cfg: ControlFlowGraph,
+        func_entry: FunctionEntry,
+        label_map: Dict[str, str],
+        ordered_nodes: List[CfgNode],
+    ) -> Dict[str, str]:
+        """
+        Second LLM call per function to normalize terminology and phrasing.
+
+        Sees all labels in execution order and can spot inconsistencies that
+        per-batch generation misses (e.g., mixing 'request' / 'req', passive
+        voice, inconsistent subject across labels).  Only changes what needs
+        changing — returns the same label_map if all is consistent.
+        """
+        # Build ordered list of (node_id, label, type) for the prompt
+        ordered_pairs = [
+            (n.node_id, label_map[n.node_id], n.node_type.value)
+            for n in ordered_nodes
+            if n.node_id in label_map
+        ]
+        if not ordered_pairs:
+            return label_map
+
+        # Determine purpose string
+        purpose = func_entry.description or ""
+        if self._pkb._knowledge:
+            fk = self._pkb._knowledge.functions.get(func_entry.qualified_name)
+            if fk and fk.comment:
+                purpose = fk.comment
+
+        node_lines = "\n".join(
+            f'  "{nid}" ({ntype}): "{lbl}"'
+            for nid, lbl, ntype in ordered_pairs
+        )
+
+        prompt = (
+            f"Function: {func_entry.qualified_name}\n"
+            + (f"Purpose: {purpose}\n" if purpose else "")
+            + f"\nFlowchart labels ({len(ordered_pairs)} nodes in execution order):\n"
+            + node_lines
+            + "\n\nReview as a set:\n"
+            "1. Fix inconsistent terminology (e.g. 'request'/'req' — pick one).\n"
+            "2. Ensure active voice throughout (e.g. 'Initialize X' not 'X is initialized').\n"
+            "3. Make labels read as a coherent step-by-step narrative.\n"
+            "4. Do NOT change node meaning — only improve phrasing/consistency.\n"
+            "5. Return only labels you changed.\n"
+            'Return ONLY: {"node_id": "improved_label", ...} or {} if nothing needs changing.'
+        )
+
+        # Cap prompt size — coherence pass is best-effort
+        if len(self._COHERENCE_SYSTEM) + len(prompt) > MAX_PROMPT_CHARS:
+            logger.debug("Coherence pass skipped for '%s': prompt too large",
+                         func_entry.qualified_name)
+            return label_map
+
+        raw = self._client.generate(self._COHERENCE_SYSTEM, prompt)
+        if not raw:
+            logger.debug("Coherence pass: no LLM response for '%s'",
+                         func_entry.qualified_name)
+            return label_map
+
+        cleaned = _extract_json(raw)
+        if not cleaned:
+            return label_map
+
+        try:
+            changes = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return label_map
+
+        if not isinstance(changes, dict) or not changes:
+            return label_map
+
+        updated = dict(label_map)
+        changed_count = 0
+        for nid, new_label in changes.items():
+            if (nid in updated
+                    and isinstance(new_label, str)
+                    and new_label.strip()
+                    and len(new_label) <= _MAX_LABEL_LEN):
+                logger.debug("Coherence: %s  %r → %r", nid, updated[nid], new_label)
+                updated[nid] = new_label.strip()
+                changed_count += 1
+
+        if changed_count:
+            logger.info("Coherence pass updated %d label(s) for '%s'",
+                        changed_count, func_entry.qualified_name)
+        return updated
 
     # ------------------------------------------------------------------
     # Apply labels back to CFG nodes
@@ -438,7 +565,164 @@ def _trim_context(context: str, budget: int) -> str:
 # ---------------------------------------------------------------------------
 
 def _make_batches(nodes: List[CfgNode], batch_size: int) -> List[List[CfgNode]]:
+    """Simple sequential batching (kept for reference / fallback)."""
     return [nodes[i: i + batch_size] for i in range(0, len(nodes), batch_size)]
+
+
+# ---------------------------------------------------------------------------
+# CFG topological sort
+# ---------------------------------------------------------------------------
+
+def _topo_sort(cfg: ControlFlowGraph) -> List[str]:
+    """
+    DFS post-order topological sort of the CFG.
+
+    Handles cycles (loop back-edges) by skipping already-in-stack nodes.
+    Returns node IDs in execution order (entry first).
+    Nodes unreachable from entry_node_id are appended at the end.
+    """
+    succ: Dict[str, List[str]] = {nid: [] for nid in cfg.nodes}
+    for edge in cfg.edges:
+        if edge.source in succ:
+            succ[edge.source].append(edge.target)
+
+    visited: Set[str] = set()
+    order: List[str] = []
+
+    def _dfs(nid: str, in_stack: Set[str]) -> None:
+        if nid in visited or nid not in cfg.nodes:
+            return
+        if nid in in_stack:   # back-edge (loop) — skip to break cycle
+            return
+        in_stack.add(nid)
+        visited.add(nid)
+        for child in succ.get(nid, []):
+            _dfs(child, in_stack)
+        in_stack.discard(nid)
+        order.append(nid)
+
+    entry = cfg.entry_node_id
+    if entry and entry in cfg.nodes:
+        _dfs(entry, set())
+    for nid in cfg.nodes:
+        if nid not in visited:
+            _dfs(nid, set())
+
+    order.reverse()
+    return order
+
+
+# ---------------------------------------------------------------------------
+# CFG-region-aware batching
+# ---------------------------------------------------------------------------
+
+# Node types that mark the start/end of a decision region.
+# When we encounter one, we flush the current batch and start a new one
+# so that sequential ACTION sequences are never split across batches.
+_BRANCH_NODE_TYPES: Set[NodeType] = {
+    NodeType.DECISION,
+    NodeType.LOOP_HEAD,
+    NodeType.SWITCH_HEAD,
+}
+
+
+def _make_region_batches(
+    ordered_nodes: List[CfgNode],
+    cfg: ControlFlowGraph,
+    batch_size: int,
+) -> List[List[CfgNode]]:
+    """
+    Group CFG nodes into batches that respect basic-block boundaries.
+
+    A new batch begins when:
+      - A merge point is reached (node has multiple predecessors in the CFG)
+      - A branch node is encountered (DECISION / LOOP_HEAD / SWITCH_HEAD)
+      - The current batch reaches batch_size
+
+    This keeps sequential ACTION sequences (e.g., all the statements that
+    build a JSON document) together in one batch, giving the LLM the full
+    context it needs to write coherent high-level labels.
+
+    Tiny single-node batches are merged with their neighbour where possible.
+    """
+    # Count predecessors for every node so we can detect merge points
+    pred_count: Dict[str, int] = {nid: 0 for nid in cfg.nodes}
+    for edge in cfg.edges:
+        if edge.target in pred_count:
+            pred_count[edge.target] += 1
+
+    batches: List[List[CfgNode]] = []
+    current: List[CfgNode] = []
+
+    for node in ordered_nodes:
+        is_merge = pred_count.get(node.node_id, 0) > 1
+        is_branch = node.node_type in _BRANCH_NODE_TYPES
+
+        # Flush if we hit a merge point or the batch is full
+        if current and (is_merge or len(current) >= batch_size):
+            batches.append(current)
+            current = []
+
+        current.append(node)
+
+        # Branch node ends the current region — flush after adding it
+        if is_branch and current:
+            batches.append(current)
+            current = []
+
+    if current:
+        batches.append(current)
+
+    return _merge_small_batches(batches, batch_size)
+
+
+def _merge_small_batches(
+    batches: List[List[CfgNode]],
+    batch_size: int,
+) -> List[List[CfgNode]]:
+    """
+    Merge single-node batches with a neighbour to avoid pointless 1-node calls.
+    Only merges when the combined size stays within batch_size.
+    """
+    if not batches:
+        return batches
+    result: List[List[CfgNode]] = [batches[0]]
+    for batch in batches[1:]:
+        last = result[-1]
+        if (len(last) == 1 or len(batch) == 1) and len(last) + len(batch) <= batch_size:
+            result[-1] = last + batch
+        else:
+            result.append(batch)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Batch callee name extractor (for targeted callee context)
+# ---------------------------------------------------------------------------
+
+def _extract_batch_callee_names(batch: List[CfgNode]) -> Set[str]:
+    """
+    Collect function names actually called in this batch's nodes.
+
+    Pulls names from each node's enriched_context['function_calls'] list
+    (populated by the CFG enricher).  Returns both qualified names and
+    short names so build_targeted_callee_context() can find matches.
+    """
+    names: Set[str] = set()
+    for node in batch:
+        for call in node.enriched_context.get("function_calls", []):
+            sig = call.get("signature", "")
+            if not sig:
+                continue
+            # qualified name: everything before '('
+            full = sig.split("(")[0].strip()
+            if full:
+                names.add(full)
+                # Also add the short name (last segment after '::')
+                short = full.split("::")[-1]
+                if short:
+                    names.add(short)
+    return names
 
 
 # ---------------------------------------------------------------------------

@@ -138,16 +138,20 @@ class ProjectKnowledgeBase:
     # Context packet construction (for LLM prompt injection)
     # ------------------------------------------------------------------
 
-    def build_context_packet(self, func_entry: FunctionEntry,
-                              base_path: str) -> str:
+    def build_base_context_packet(self, func_entry: FunctionEntry,
+                                   base_path: str) -> str:
         """
-        Construct a concise, LLM-ready context block for a function.
+        Static portion of the context packet — same for all batches of a function.
 
-        Structure:
+        Includes:
           1. Project hierarchy context  (project → module → file)
-          2. Parameters + type meanings
-          3. Function purpose
-          4. 4-level callee call graph  (BFS, project-only, deduplicated)
+          2. Caller context             (who calls this function and why)
+          3. Parameters + type meanings
+          4. Function purpose
+          5. Function execution phases
+
+        Does NOT include callee BFS — that is done per-batch via
+        build_targeted_callee_context() so only relevant callees are injected.
         """
         sections: List[str] = []
 
@@ -156,7 +160,12 @@ class ProjectKnowledgeBase:
         if hierarchy:
             sections.append(hierarchy)
 
-        # ── 2. Parameters ─────────────────────────────────────────────
+        # ── 2. Caller context (1-level upward from calledByIds) ────────
+        caller = self._build_caller_context(func_entry)
+        if caller:
+            sections.append(caller)
+
+        # ── 3. Parameters ─────────────────────────────────────────────
         if func_entry.params:
             param_desc = ", ".join(
                 f"{p.get('type', '')} {p.get('name', '')}".strip()
@@ -170,7 +179,7 @@ class ProjectKnowledgeBase:
                 for tc in type_context:
                     sections.append(f"  {tc}")
 
-        # ── 3. Function purpose ────────────────────────────────────────
+        # ── 4. Function purpose ────────────────────────────────────────
         purpose = ""
         if self._knowledge:
             fk = self._knowledge.functions.get(func_entry.qualified_name)
@@ -181,7 +190,7 @@ class ProjectKnowledgeBase:
         if purpose:
             sections.append(f"Purpose: {purpose}")
 
-        # ── 3b. Function phases (logical sections) ─────────────────────
+        # ── 5. Function phases (logical sections) ─────────────────────
         phases = self.get_function_phases(func_entry)
         if phases:
             phase_lines = ["Function execution phases:"]
@@ -192,12 +201,103 @@ class ProjectKnowledgeBase:
                 phase_lines.append(f"  Phase {i} (lines {sl}–{el}): {desc}")
             sections.append("\n".join(phase_lines))
 
-        # ── 4. 4-level callee call graph ───────────────────────────────
-        callee_context = self._build_callee_bfs_context(func_entry, base_path)
-        if callee_context:
-            sections.append(callee_context)
-
         return "\n".join(sections)
+
+    def build_targeted_callee_context(self, func_entry: FunctionEntry,
+                                       callee_names: Set[str]) -> str:
+        """
+        Build callee context for only the functions actually called in a batch.
+
+        Looks up each name in the knowledge base (exact match then short-name
+        fallback).  Much more focused than the broad 4-level BFS — prevents
+        injecting dozens of unrelated callees when only 2–3 are relevant.
+
+        Returns an empty string if no project callees match.
+        """
+        if not callee_names or not self._knowledge:
+            return ""
+
+        entries: List[str] = []
+        seen: Set[str] = set()
+
+        for name in callee_names:
+            # 1. Exact qualified-name match
+            fk = self._knowledge.functions.get(name)
+            if not fk:
+                # 2. Short-name fallback (strip namespaces)
+                short = name.split("::")[-1].split("(")[0].strip()
+                for qname, stored in self._knowledge.functions.items():
+                    if qname.split("::")[-1] == short:
+                        fk = stored
+                        break
+
+            if fk and fk.qualified_name not in seen:
+                seen.add(fk.qualified_name)
+                entries.append(_format_callee_entry(_make_callee_info(fk.qualified_name, fk)))
+
+        if not entries:
+            return ""
+
+        return "\n=== Relevant Called Functions ===\n" + "\n".join(entries)
+
+    def build_context_packet(self, func_entry: FunctionEntry,
+                              base_path: str) -> str:
+        """
+        Full context packet including 4-level BFS callee graph.
+
+        Kept for backward compatibility.  The label generator now uses
+        build_base_context_packet() + build_targeted_callee_context() instead,
+        which gives more focused, per-batch callee context.
+        """
+        base = self.build_base_context_packet(func_entry, base_path)
+        callee = self._build_callee_bfs_context(func_entry, base_path)
+        if callee:
+            return base + "\n" + callee
+        return base
+
+    # ------------------------------------------------------------------
+    # Caller context builder  (1-level upward from calledByIds)
+    # ------------------------------------------------------------------
+
+    def _build_caller_context(self, func_entry: FunctionEntry) -> str:
+        """
+        Inject 1-level upward context: which project functions call this one
+        and what they are trying to accomplish.
+
+        This gives the LLM the "why" — the higher-level intent of the callers
+        — which is critical for labeling helper functions whose internal code
+        looks opaque without knowing the calling context.
+
+        Caps at 5 callers to avoid bloating the context packet.
+        """
+        if not func_entry.called_by_ids:
+            return ""
+
+        caller_lines: List[str] = []
+        seen: Set[str] = set()
+
+        for cid in func_entry.called_by_ids[:8]:  # scan up to 8, keep first 5 hits
+            qname = _callsid_to_qname(cid)
+            if not qname or qname in seen:
+                continue
+            seen.add(qname)
+
+            fk = self._knowledge.functions.get(qname) if self._knowledge else None
+            if fk:
+                sig = fk.signature or qname
+                desc = fk.comment or ""
+                line = f"  - {sig}" + (f"  →  {desc}" if desc else "")
+            else:
+                line = f"  - {qname}"
+
+            caller_lines.append(line)
+            if len(caller_lines) >= 5:
+                break
+
+        if not caller_lines:
+            return ""
+
+        return "Called by (callers of this function):\n" + "\n".join(caller_lines)
 
     # ------------------------------------------------------------------
     # Hierarchy context builder

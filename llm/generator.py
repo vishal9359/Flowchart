@@ -107,9 +107,11 @@ class LabelGenerator:
         if not labelable:
             return
 
-        # Build static (per-function) context — hierarchy + callers + purpose + phases.
-        # Callee context is added per-batch in _label_batch() for better targeting.
-        base_context = self._pkb.build_base_context_packet(func_entry, base_path)
+        # Build static (per-function) context — hierarchy + callers + purpose + phases
+        # + full BFS callee graph (always present as baseline callee context).
+        # Per-batch targeted callee context is ADDED ON TOP in _label_batch(), so we
+        # never lose callee context even when enriched_context["function_calls"] is empty.
+        base_context = self._pkb.build_context_packet(func_entry, base_path)
         phases = self._pkb.get_function_phases(func_entry)
 
         # Order labelable nodes in CFG execution order (topological sort).
@@ -251,6 +253,13 @@ class LabelGenerator:
         total_chars = len(SYSTEM_PROMPT) + len(base_prompt)
         logger.debug("Batch prompt: %d chars (~%d tokens) for %d nodes",
                      total_chars, total_chars // 4, len(batch))
+        # Print full prompt at TRACE level (set env FLOWCHART_TRACE=1 to enable)
+        import os
+        if os.environ.get("FLOWCHART_TRACE"):
+            print("\n" + "="*60)
+            print(f"[TRACE] SYSTEM PROMPT:\n{SYSTEM_PROMPT[:500]}...")
+            print(f"[TRACE] USER PROMPT:\n{base_prompt}")
+            print("="*60 + "\n")
 
         required_ids = {n.node_id for n in batch}
         accumulated: Dict[str, str] = {}

@@ -349,19 +349,22 @@ def _build_node_list(
 
 def _extract_code_identifiers(code: str) -> Set[str]:
     """
-    Extract meaningful variable/object identifiers from C++ raw_code.
+    Extract variable/object identifiers from C++ raw_code for data-flow hints.
 
-    Filters out C++ keywords, single-character names, and pure numeric tokens.
-    Used for data-flow hint computation: identifiers that appear in multiple
-    nodes within a batch indicate shared state the LLM should group together.
+    Crucially: filters out function/method call names (identifiers followed by
+    '(').  We want objects that carry state across nodes (e.g. 'doc', 'req'),
+    not method names (e.g. 'SetObject', 'AddMember') which appear shared only
+    because multiple nodes call methods on the same object.
+
+    Also filters: C++ keywords, ALL-CAPS macros/constants, names shorter than 3
+    characters.
     """
-    tokens = re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\b', code)
+    # Match identifiers NOT immediately followed by '(' — excludes call names
+    tokens = re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\()', code)
     return {
         t for t in tokens
         if t not in _CPP_KEYWORDS and len(t) > 2 and not t.isupper()
     }
-    # Note: isupper() filters ALL-CAPS macros (LOG_ERROR, MAX_RETRY_COUNT)
-    # which are constants, not variable/object identifiers.
 
 
 def _truncate(s: str, max_chars: int) -> str:

@@ -250,12 +250,12 @@ Each JSON file is an array:
 [
   {
     "functionKey":   "src|myfile|MyClass::myMethod|int,bool",
-    "qualifiedName": "MyClass::myMethod",
+    "name":          "MyClass::myMethod",
     "flowchart":     "flowchart TD\n    N0([Start: myMethod])\n    ..."
   },
   {
     "functionKey":   "src|myfile|MyClass::otherMethod|void",
-    "qualifiedName": "MyClass::otherMethod",
+    "name":          "MyClass::otherMethod",
     "flowchart":     "flowchart TD\n    ...",
     "error":         null
   }
